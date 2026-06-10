@@ -3,6 +3,8 @@ monitor_idx.py — Screening sinyal otomatis ~100 saham IHSG + alert Telegram.
 
 Sumber data : Yahoo Finance via yfinance (ticker .JK)
 Indikator   : EMA20, RSI(14), Parabolic SAR, MACD(12,26,9) — dihitung manual
+Bandarmology: proxy pergerakan bandar dari OBV/ADL/MFI + lonjakan volume + CLV
+              (broker summary & net foreign asli tidak tersedia di yfinance)
 Output      : idx_sinyal.csv + pesan alert ke Telegram (pakai requests)
 
 Cara jalankan:
@@ -154,6 +156,104 @@ def swing_levels(high: pd.Series, low: pd.Series, price: float,
 
 
 # ---------------------------------------------------------------------------
+# Bandarmology — proxy pergerakan bandar dari volume + harga (OHLCV)
+#
+# Catatan: bandarmology "asli" butuh broker summary & net foreign buy/sell
+# yang TIDAK ada di yfinance. Fungsi di bawah memperkirakan jejak bandar dari
+# aliran volume (OBV/ADL/MFI), lonjakan volume, dan posisi close di range.
+# ---------------------------------------------------------------------------
+
+def obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    """On-Balance Volume — volume mengalir mengikuti arah harga."""
+    direction = np.sign(close.diff().fillna(0))
+    return (direction * volume).cumsum()
+
+
+def adl(high: pd.Series, low: pd.Series, close: pd.Series,
+        volume: pd.Series) -> pd.Series:
+    """Accumulation/Distribution Line (Chaikin)."""
+    rng = (high - low).replace(0, np.nan)
+    mfm = ((close - low) - (high - close)) / rng     # money flow multiplier
+    return (mfm.fillna(0) * volume).cumsum()
+
+
+def mfi(high: pd.Series, low: pd.Series, close: pd.Series,
+        volume: pd.Series, period: int = 14) -> pd.Series:
+    """Money Flow Index — RSI tertimbang volume (0-100)."""
+    tp = (high + low + close) / 3                     # typical price
+    raw = tp * volume
+    pos = raw.where(tp > tp.shift(1), 0.0)
+    neg = raw.where(tp < tp.shift(1), 0.0)
+    pos_sum = pos.rolling(period).sum()
+    neg_sum = neg.rolling(period).sum().replace(0, np.nan)
+    mr = pos_sum / neg_sum
+    return (100 - 100 / (1 + mr)).fillna(50)
+
+
+def bandar_analysis(df: pd.DataFrame) -> dict:
+    """Deteksi jejak bandar: AKUMULASI / DISTRIBUSI / NETRAL + arah aliran."""
+    close = df["Close"].astype(float)
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    volume = df["Volume"].astype(float)
+
+    obv_line = obv(close, volume)
+    adl_line = adl(high, low, close, volume)
+    mfi_line = mfi(high, low, close, volume)
+
+    vol_avg = volume.rolling(20).mean().iloc[-1]
+    vol_ratio = float(volume.iloc[-1] / vol_avg) if vol_avg and vol_avg > 0 else 1.0
+    rng = float(high.iloc[-1] - low.iloc[-1])
+    clv = (((close.iloc[-1] - low.iloc[-1]) -
+            (high.iloc[-1] - close.iloc[-1])) / rng) if rng > 0 else 0.0
+
+    # tren aliran 5 hari terakhir
+    obv_up = bool(obv_line.iloc[-1] > obv_line.iloc[-5])
+    adl_up = bool(adl_line.iloc[-1] > adl_line.iloc[-5])
+    mfi_now = float(mfi_line.iloc[-1])
+    price_up = bool(close.iloc[-1] > close.iloc[-2])
+    big_vol = vol_ratio >= 1.5                       # lonjakan volume = bandar aktif
+
+    acc = sum([
+        obv_up,
+        adl_up,
+        mfi_now > 50,
+        big_vol and price_up,                        # volume besar + harga naik = masuk
+        clv > 0.2,                                   # close dekat high = serapan beli
+    ])
+    dist = sum([
+        not obv_up,
+        not adl_up,
+        mfi_now < 50,
+        big_vol and not price_up,                    # volume besar + harga turun = keluar
+        clv < -0.2,
+    ])
+
+    if acc >= 3 and acc > dist:
+        status = "AKUMULASI"
+    elif dist >= 3 and dist > acc:
+        status = "DISTRIBUSI"
+    else:
+        status = "NETRAL"
+
+    if obv_up and adl_up:
+        flow = "↑"
+    elif not obv_up and not adl_up:
+        flow = "↓"
+    else:
+        flow = "→"
+
+    return {
+        "bandar_status": status,
+        "bandar_flow": flow,
+        "bandar_score": acc - dist,
+        "mfi": mfi_now,
+        "vol_ratio": vol_ratio,
+        "clv": clv,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Logika sinyal
 # ---------------------------------------------------------------------------
 
@@ -192,6 +292,7 @@ def evaluate_signal(df: pd.DataFrame) -> dict | None:
     bear_count = sum([b_below_ema, b_rsi, b_sar, b_macd])
 
     support, resistance = swing_levels(high, low, price)
+    bandar = bandar_analysis(df)                   # jejak pergerakan bandar
 
     # Urutan prioritas: BUY -> LIMIT -> NO
     if bull_count >= 3:
@@ -202,6 +303,18 @@ def evaluate_signal(df: pd.DataFrame) -> dict | None:
         signal = "NO"
     else:
         signal = "NO"
+
+    # Konfirmasi bandar: BUY/LIMIT sejalan akumulasi = sinyal kuat;
+    # kalau bandar justru distribusi, beri tanda waspada (tetap dieksekusi user).
+    if signal in ("BUY", "LIMIT"):
+        if bandar["bandar_status"] == "AKUMULASI":
+            grade = "STRONG"
+        elif bandar["bandar_status"] == "DISTRIBUSI":
+            grade = "WASPADA"
+        else:
+            grade = "NETRAL"
+    else:
+        grade = "-"
 
     # Entry / SL / TP
     if signal == "LIMIT":
@@ -228,6 +341,8 @@ def evaluate_signal(df: pd.DataFrame) -> dict | None:
         "resistance": resistance,
         "bull_count": bull_count,
         "bear_count": bear_count,
+        "grade": grade,
+        **bandar,
     }
 
 
@@ -270,24 +385,36 @@ def fmt(value: float) -> str:
     return f"{value:.2f}"
 
 
-def build_message(buys: list, limits: list, bias: str,
-                  valid: int, total: int, now: datetime) -> str:
+_BANDAR_ICON = {"AKUMULASI": "🟢", "DISTRIBUSI": "🔴", "NETRAL": "⚪"}
+
+
+def _bandar_tag(s: dict) -> str:
+    icon = _BANDAR_ICON.get(s.get("bandar_status", "NETRAL"), "⚪")
+    return f"🏦 {icon}{s.get('bandar_status', 'NETRAL')}{s.get('bandar_flow', '')}"
+
+
+def build_message(buys: list, limits: list, bias: str, valid: int, total: int,
+                  now: datetime, bandar_acc: int = 0, bandar_dist: int = 0) -> str:
     header = f"📊 IDX ALERT — {now:%d-%m-%Y %H:%M}"
     bias_icon = {"bullish": "🟢", "bearish": "🔴"}.get(bias, "⚪")
+    # Ringkasan pergerakan bandar seluruh pasar yang discreening
+    bandar_line = f"🏦 Bandar: {bandar_acc} akumulasi / {bandar_dist} distribusi"
 
     if not buys and not limits:
         return (f"{header}\n"
                 f"🔴 TIDAK ADA SETUP — CASH IS POSITION\n"
-                f"⚠️ IHSG: {bias_icon} {bias}")
+                f"⚠️ IHSG: {bias_icon} {bias}\n"
+                f"{bandar_line}")
 
     lines = [header]
     for s in buys:
         lines.append(f"🟢 BUY: {s['ticker']} @ {fmt(s['entry'])} | "
-                     f"SL: {fmt(s['sl'])} | TP: {fmt(s['tp1'])}")
+                     f"SL: {fmt(s['sl'])} | TP: {fmt(s['tp1'])} | {_bandar_tag(s)}")
     for s in limits:
         lines.append(f"🟡 LIMIT: {s['ticker']} @ {fmt(s['entry'])} | "
-                     f"SL: {fmt(s['sl'])} | TP: {fmt(s['tp1'])}")
+                     f"SL: {fmt(s['sl'])} | TP: {fmt(s['tp1'])} | {_bandar_tag(s)}")
     lines.append(f"⚠️ IHSG: {bias_icon} {bias}")
+    lines.append(bandar_line)
     lines.append(f"💰 Setup valid: {valid} dari {total}")
     return "\n".join(lines)
 
@@ -331,6 +458,7 @@ def run():
     print(f"Bias IHSG: {bias}\n")
 
     rows, buys, limits = [], [], []
+    bandar_acc = bandar_dist = 0
     for i, code in enumerate(WATCHLIST, 1):
         ticker = f"{code}.JK"
         try:
@@ -344,15 +472,22 @@ def run():
             print(f"[{i:>3}/{len(WATCHLIST)}] {code:<6} data kurang, skip")
             continue
 
+        if res["bandar_status"] == "AKUMULASI":
+            bandar_acc += 1
+        elif res["bandar_status"] == "DISTRIBUSI":
+            bandar_dist += 1
+
         icon = {"BUY": "🟢", "LIMIT": "🟡", "NO": "🔴"}[res["signal"]]
         print(f"[{i:>3}/{len(WATCHLIST)}] {code:<6} {icon} {res['signal']:<5} "
-              f"px={fmt(res['price'])} rsi={res['rsi']:.1f} "
-              f"bull={res['bull_count']}")
+              f"px={fmt(res['price'])} rsi={res['rsi']:.1f} bull={res['bull_count']} "
+              f"🏦{res['bandar_status']}{res['bandar_flow']}")
 
         row = {"tanggal": f"{now:%Y-%m-%d}", "jam": f"{now:%H:%M}",
                "saham": code, **{k: res[k] for k in
                ("signal", "price", "entry", "sl", "tp1", "tp2",
-                "rsi", "ema20", "sar", "macd_hist", "support", "resistance")}}
+                "rsi", "ema20", "sar", "macd_hist", "support", "resistance",
+                "bandar_status", "bandar_flow", "bandar_score", "mfi",
+                "vol_ratio", "grade")}}
         rows.append(row)
 
         entry = {"ticker": code, **res}
@@ -365,7 +500,9 @@ def run():
 
     save_csv(rows)
     valid = len(buys) + len(limits)
-    message = build_message(buys, limits, bias, valid, len(rows) or len(WATCHLIST), now)
+    message = build_message(buys, limits, bias, valid,
+                            len(rows) or len(WATCHLIST), now,
+                            bandar_acc, bandar_dist)
     print("\n" + "=" * 40)
     print(message)
     print("=" * 40 + "\n")
@@ -389,9 +526,17 @@ def _synthetic_df(kind: str, n: int = 120) -> pd.DataFrame:
     close = base + noise
     high = close + rng.uniform(2, 8, n)
     low = close - rng.uniform(2, 8, n)
+    # Volume naik di tren naik (bandar masuk), turun di tren turun (bandar keluar)
+    if kind == "uptrend":
+        volume = np.linspace(1_000_000, 3_000_000, n)
+    elif kind == "downtrend":
+        volume = np.linspace(3_000_000, 1_000_000, n)
+    else:
+        volume = np.concatenate([np.full(n - 10, 1_000_000),
+                                 np.linspace(1_500_000, 3_000_000, 10)])
     idx = pd.date_range("2024-01-01", periods=n, freq="D")
     return pd.DataFrame({"Close": close, "High": high, "Low": low,
-                         "Open": close, "Volume": 1_000_000}, index=idx)
+                         "Open": close, "Volume": volume}, index=idx)
 
 
 def selftest():
@@ -403,16 +548,22 @@ def selftest():
         print(f"{kind:<10} -> {res['signal']:<5} "
               f"price={fmt(res['price'])} entry={fmt(res['entry'])} "
               f"sl={fmt(res['sl'])} tp1={fmt(res['tp1'])} tp2={fmt(res['tp2'])} "
-              f"rsi={res['rsi']:.1f} bull={res['bull_count']} bear={res['bear_count']}")
+              f"rsi={res['rsi']:.1f} bull={res['bull_count']} "
+              f"🏦{res['bandar_status']}{res['bandar_flow']} "
+              f"(mfi={res['mfi']:.0f} volx={res['vol_ratio']:.1f} grade={res['grade']})")
 
-    # Uji format pesan
+    # Uji format pesan (lengkap dengan tag bandar)
     now = datetime(2026, 6, 10, 15, 30)
-    buys = [{"ticker": "BBCA", "entry": 9800, "sl": 9506, "tp1": 10200}]
-    limits = [{"ticker": "ANTM", "entry": 1500, "sl": 1455, "tp1": 1620}]
+    buys = [{"ticker": "BBCA", "entry": 9800, "sl": 9506, "tp1": 10200,
+             "bandar_status": "AKUMULASI", "bandar_flow": "↑"}]
+    limits = [{"ticker": "ANTM", "entry": 1500, "sl": 1455, "tp1": 1620,
+               "bandar_status": "NETRAL", "bandar_flow": "→"}]
     print("\n-- contoh pesan ada setup --")
-    print(build_message(buys, limits, "bullish", 2, 100, now))
+    print(build_message(buys, limits, "bullish", 2, 100, now,
+                        bandar_acc=18, bandar_dist=7))
     print("\n-- contoh pesan semua NO --")
-    print(build_message([], [], "bearish", 0, 100, now))
+    print(build_message([], [], "bearish", 0, 100, now,
+                        bandar_acc=4, bandar_dist=31))
     print("\n[OK] self-test selesai.")
 
 
