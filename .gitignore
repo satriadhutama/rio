@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 idx_sinyal.csv
+ranking_lengkap.csv
+gagal.txt
