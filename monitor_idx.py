@@ -85,6 +85,7 @@ SEKTOR_FILE = "sektor.txt"
 MACRO_FILE = "macro.txt"
 RANKING_CSV = "ranking_lengkap.csv"
 GAGAL_FILE = "gagal.txt"
+LOG_FILE = "trading_log.txt"
 
 IHSG_TICKER = "^JKSE"
 
@@ -981,6 +982,28 @@ def send_telegram(text: str) -> bool:
         return False
 
 
+def append_log(status: str, total: int, n_liquid: int, n_qualified: int,
+                picks: list, telegram_status: str, error_msg: str = None):
+    """Tulis 1 entri ke trading_log.txt (audit jejak tiap eksekusi)."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if picks:
+        picks_str = ", ".join(f"{p['Ticker']}({p['Final_Score']:.0f})" for p in picks)
+    else:
+        picks_str = "-"
+    lines = [
+        f"[{ts}] {status} | Lolos likuiditas: {n_liquid}/{total} | Lolos ambang: {n_qualified}",
+        f"  Top picks: {picks_str}",
+        f"  Telegram: {telegram_status}",
+    ]
+    if error_msg:
+        lines.append(f"  Error: {error_msg}")
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except Exception as exc:                             # noqa: BLE001
+        print(f"[WARN] gagal tulis {LOG_FILE}: {exc}")
+
+
 # ===========================================================================
 # PIPELINE INTI
 # ===========================================================================
@@ -1020,28 +1043,47 @@ def run(send=True):
     print(f"Screening Wyckoff/SMC {total} saham IDX — {now:%Y-%m-%d %H:%M}")
     print("Catatan: skor Akumulasi/SmartMoney/ForeignFlow = PROXY dari OHLCV.\n")
 
-    ihsg_close = fetch_ihsg()
-    data_map, gagal = download_all(codes)
-    print(f"\nUnduh OK {len(data_map)}/{total}. Gagal: {len(gagal)}")
-    if gagal:
-        with open(GAGAL_FILE, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(gagal) + "\n")
-        print(f"[OK] {len(gagal)} ticker gagal -> {GAGAL_FILE}: {gagal}")
+    status = "SUCCESS"
+    n_liquid = 0
+    n_qualified = 0
+    picks: list = []
+    telegram_status = "SKIPPED"
+    error_msg = None
 
-    rows, skipped = screen(data_map, sektor_map, ihsg_close, now)
-    n_liquid = len(rows)
-    print(f"Lolos filter likuiditas: {n_liquid} (skip {skipped} karena value20d < Rp3M)")
-    save_csv(rows)
+    try:
+        ihsg_close = fetch_ihsg()
+        data_map, gagal = download_all(codes)
+        print(f"\nUnduh OK {len(data_map)}/{total}. Gagal: {len(gagal)}")
+        if gagal:
+            with open(GAGAL_FILE, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(gagal) + "\n")
+            print(f"[OK] {len(gagal)} ticker gagal -> {GAGAL_FILE}: {gagal}")
+            status = "PARTIAL_FAIL"
 
-    qualified = [r for r in rows if r["Final_Score"] >= SCORE_THRESHOLD]
-    picks = qualified[:MAX_PICKS]
-    message = build_message(picks, len(qualified), n_liquid, macro, now)
+        rows, skipped = screen(data_map, sektor_map, ihsg_close, now)
+        n_liquid = len(rows)
+        print(f"Lolos filter likuiditas: {n_liquid} (skip {skipped} karena value20d < Rp3M)")
+        save_csv(rows)
 
-    print("\n" + "=" * 52)
-    print(message)
-    print("=" * 52 + "\n")
-    if send:
-        send_telegram(message)
+        qualified = [r for r in rows if r["Final_Score"] >= SCORE_THRESHOLD]
+        n_qualified = len(qualified)
+        picks = qualified[:MAX_PICKS]
+        message = build_message(picks, n_qualified, n_liquid, macro, now)
+
+        print("\n" + "=" * 52)
+        print(message)
+        print("=" * 52 + "\n")
+
+        if send:
+            telegram_status = "SENT" if send_telegram(message) else "FAILED"
+        else:
+            telegram_status = "SKIPPED"
+    except Exception as exc:                             # noqa: BLE001
+        status = "ERROR"
+        error_msg = str(exc)
+        print(f"[ERROR] run() gagal: {exc}")
+    finally:
+        append_log(status, total, n_liquid, n_qualified, picks, telegram_status, error_msg)
 
 
 # ===========================================================================
