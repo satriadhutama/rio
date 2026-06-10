@@ -1004,6 +1004,31 @@ def append_log(status: str, total: int, n_liquid: int, n_qualified: int,
         print(f"[WARN] gagal tulis {LOG_FILE}: {exc}")
 
 
+def check_internet(timeout: int = 5) -> bool:
+    """Cek koneksi internet umum (best-effort GET ke beberapa endpoint)."""
+    targets = ("https://www.google.com", "https://1.1.1.1")
+    for url in targets:
+        try:
+            requests.get(url, timeout=timeout)
+            return True
+        except Exception:                                # noqa: BLE001
+            continue
+    return False
+
+
+def wait_for_internet(max_attempts: int = 3, delay: int = 30) -> bool:
+    """Cek internet, kalau gagal tunggu `delay` detik & coba lagi max_attempts kali."""
+    for i in range(max_attempts):
+        if check_internet():
+            if i > 0:
+                print(f"[OK] internet kembali tersambung setelah percobaan ke-{i + 1}.")
+            return True
+        if i < max_attempts - 1:
+            print(f"[WARN] internet down, retry {i + 1}/{max_attempts} setelah {delay}s...")
+            time.sleep(delay)
+    return False
+
+
 # ===========================================================================
 # PIPELINE INTI
 # ===========================================================================
@@ -1042,6 +1067,24 @@ def run(send=True):
     total = len(codes)
     print(f"Screening Wyckoff/SMC {total} saham IDX — {now:%Y-%m-%d %H:%M}")
     print("Catatan: skor Akumulasi/SmartMoney/ForeignFlow = PROXY dari OHLCV.\n")
+
+    # Pre-flight: internet WAJIB ada sebelum unduh Yahoo Finance.
+    # Gagal 3x -> log INTERNET_DOWN dan exit 1 supaya Task Scheduler retry.
+    print("Cek koneksi internet...")
+    if not wait_for_internet(max_attempts=3, delay=30):
+        print("[ERROR] INTERNET_DOWN — screening dibatalkan.")
+        alert = (f"⚠️ {now:%d-%m-%Y %H:%M} INTERNET DOWN\n"
+                 "Screening IDX dibatalkan. Task Scheduler akan retry "
+                 "sesuai jadwal RestartOnFailure (tiap 5 mnt, maks 3x).")
+        tg = "SKIPPED"
+        if send:
+            try:
+                tg = "SENT" if send_telegram(alert) else "FAILED"
+            except Exception:                            # noqa: BLE001
+                tg = "FAILED"
+        append_log("ERROR", total, 0, 0, [], tg, "INTERNET_DOWN")
+        sys.exit(1)
+    print("[OK] internet OK.\n")
 
     status = "SUCCESS"
     n_liquid = 0

@@ -1,6 +1,6 @@
 """
 MATIKAN_JADWAL.py — Tombol darurat: hapus SEMUA jadwal screening IDX
-(IDX_Screening_*) dari Windows Task Scheduler.
+(IDX_Screening_* dan IDX_Weekly_Report_*) dari Windows Task Scheduler.
 
 Pakai ini kalau:
   - mau berhenti sementara (misal lagi cuti / pasar tutup lama)
@@ -12,7 +12,7 @@ CARA PAKAI:
   python MATIKAN_JADWAL.py
 
 Tidak akan menghapus jadwal lain di komputer kamu — hanya yang namanya
-diawali "IDX_Screening_".
+diawali "IDX_Screening_" atau "IDX_Weekly_".
 """
 
 import subprocess
@@ -29,13 +29,14 @@ def list_idx_tasks():
 
     tasks = []
     for line in result.stdout.splitlines():
-        if "IDX_Screening_" in line:
+        if "IDX_Screening_" in line or "IDX_Weekly_" in line:
             kolom = [c.strip('"') for c in line.split('","')]
             kolom[0] = kolom[0].lstrip('"')
             nama_task = kolom[0].lstrip("\\")
-            if nama_task.startswith("IDX_Screening_"):
+            if (nama_task.startswith("IDX_Screening_")
+                    or nama_task.startswith("IDX_Weekly_")):
                 tasks.append(nama_task)
-    return tasks
+    return sorted(set(tasks))
 
 
 def delete_task(name: str) -> bool:
