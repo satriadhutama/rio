@@ -1,38 +1,67 @@
 """
-monitor_idx.py — Sistem skoring bertingkat (bottom-up) screening top 100 saham IDX.
+monitor_idx.py — Screening Wyckoff/SMC bottom-up untuk top 100 saham IDX.
+
+Tujuan: cari saham fase akhir AKUMULASI -> awal MARKUP untuk swing 1-10 hari.
+Sistem ini MENYARING kandidat, BUKAN memutuskan. Verifikasi manual di RTI
+(broker summary + foreign flow asli) tetap WAJIB sebelum entry.
 
 ================================================================
-ARSITEKTUR 4 LAYER (tiap layer menghasilkan skor 0-100, bukan filter mati):
-
-    Skor akhir = Bandar x 0.45 + Teknikal x 0.30 + MacroID x 0.15 + Global x 0.10
-
-  Layer 1  Bandarmology proxy (45%) : OBV, ADL, MFI, volume spike, CLV (dari OHLCV)
-  Layer 2  Teknikal          (30%) : EMA20/50, RSI, Parabolic SAR, MACD, S/R
-  Layer 3  Macro Indonesia   (15%) : IHSG_BIAS + bias sektor (dari macro.txt)
-  Layer 4  Global macro      (10%) : USD/IDR, komoditas, risk sentiment (macro.txt)
-
-Catatan jujur: bandarmology "asli" butuh broker summary & net foreign yang TIDAK
-tersedia di Yahoo Finance. Layer 1 di sini adalah PROXY berbasis volume-harga.
+TRANSPARANSI DATA
+  ASLI (Yahoo Finance)  : OHLC, Volume, Value (Volume x Close)
+  PROXY (estimasi OHLCV): semua skor "Akumulasi/SmartMoney/ForeignFlow" di
+                          bawah ini adalah ESTIMASI dari pola harga & volume,
+                          BUKAN data broker summary / foreign flow asli.
+  Setiap kolom proxy diberi label "(proxy)" di CSV & Telegram.
 
 ================================================================
-FILE PENDUKUNG (semua bisa kamu edit, tanpa ngoding):
-  top100.txt  : 100 ticker IDX (1 per baris, tanpa .JK)
-  sektor.txt  : tag sektor   -> TICKER=SEKTOR
-  macro.txt   : input makro manual (Layer 3 & 4)
+ARSITEKTUR SKOR (semua 0-100 sebelum dibobot)
+
+  Final = Akumulasi*0.40 + SmartMoney*0.25 + ForeignFlow*0.15
+        + Volume*0.10    + Momentum*0.10   - RisikoDistribusi*0.20
+  (di-clamp ke 0-100 setelah penalti)
+
+  1. Akumulasi (40%)        : ADL/OBV slope, range contraction, CLV, MFI, spring
+  2. Smart Money (25%, proxy): volume climax, effort-vs-result, strong close, dst
+  3. Foreign Flow (15%, PROXY): konsistensi, RS vs IHSG, money-flow streak
+  4. Volume (10%)           : rasio vs avg5/avg20, tren, bonus likuiditas besar
+  5. Momentum (10%)         : RSI/MACD/EMA, dengan penalti telat/overbought
+  6. Risiko Distribusi (penalti 20%): upper-wick, lower-highs, divergensi ADL/MFI
+
+  macro.txt TIDAK masuk Final Score -> hanya konteks di header Telegram.
+
+================================================================
+FASE WYCKOFF (tag per saham, lihat classify_phase())
+  Akumulasi Awal / Akumulasi Matang / Markup Awal / Markup Kuat /
+  Distribusi Awal / Distribusi Matang / Netral
+
+KLASIFIKASI FINAL SCORE
+  >=90 ⭐⭐⭐ SANGAT SIAP MARKUP   80-89 ⭐⭐ SIAP MARKUP
+  70-79 ⭐ WATCHLIST PRIORITAS    60-69 ⚠️ PERLU KONFIRMASI
+  <60  HINDARI (tidak dikirim Telegram)
+
+================================================================
+FILTER LIKUIDITAS (hard filter, sebelum skoring)
+  Value 20d (Volume x Close rata-rata) < Rp 3 miliar -> SKIP
+  Value 20d > Rp 20 miliar -> bonus +5 ke skor Volume
+
+================================================================
+FILE PENDUKUNG (edit manual, tanpa coding):
+  top100.txt  : 100 ticker IDX (tanpa .JK)
+  sektor.txt  : TICKER=SEKTOR
+  macro.txt   : konteks makro (ditampilkan, tidak memengaruhi Final Score)
 
 OUTPUT:
-  ranking_lengkap.csv : semua 100 saham + skor tiap layer + alasan (untuk audit)
-  gagal.txt           : ticker yang gagal diunduh
-  Telegram            : maksimal 4 saham teratas dengan skor akhir >= 65
+  ranking_lengkap.csv : semua saham (lolos filter) + skor tiap layer + alasan
+  gagal.txt           : ticker gagal diunduh
+  Telegram            : top 5 dengan Final Score >= 60
 
 CARA JALANKAN:
   pip install yfinance pandas numpy requests
-  export TELEGRAM_BOT_TOKEN="xxxx"        # rahasia, jangan commit
-  export TELEGRAM_CHAT_ID="1674060319"    # opsional, ada default
-  python monitor_idx.py
-
-  python monitor_idx.py --selftest    # uji logika offline (tanpa internet)
-  python monitor_idx.py --no-telegram # screening + CSV saja, tak kirim Telegram
+  export TELEGRAM_BOT_TOKEN="xxxx"
+  export TELEGRAM_CHAT_ID="1674060319"
+  python monitor_idx.py                 # full run + kirim Telegram
+  python monitor_idx.py --no-telegram   # screening + CSV saja
+  python monitor_idx.py --selftest      # uji logika offline (data sintetis)
 """
 
 import os
@@ -48,7 +77,7 @@ import requests
 # Konfigurasi umum
 # ---------------------------------------------------------------------------
 
-DEFAULT_CHAT_ID = "1674060319"          # chat id bukan rahasia -> boleh default
+DEFAULT_CHAT_ID = "1674060319"
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
 TOP100_FILE = "top100.txt"
@@ -57,24 +86,25 @@ MACRO_FILE = "macro.txt"
 RANKING_CSV = "ranking_lengkap.csv"
 GAGAL_FILE = "gagal.txt"
 
-# Bobot tiap layer (jumlah = 1.0)
-W_BANDAR, W_TEKNIKAL, W_MACRO_ID, W_GLOBAL = 0.45, 0.30, 0.15, 0.10
+IHSG_TICKER = "^JKSE"
 
-SCORE_THRESHOLD = 65                    # ambang minimal masuk Telegram
-MAX_PICKS = 4                           # maksimal saham dikirim ke Telegram
+# Bobot Final Score (lihat docstring)
+W_AKUMULASI, W_SMARTMONEY, W_FOREIGN = 0.40, 0.25, 0.15
+W_VOLUME, W_MOMENTUM, W_RISIKO = 0.10, 0.10, 0.20
+
+SCORE_THRESHOLD = 60                    # ambang minimal masuk Telegram
+MAX_PICKS = 5
+
+# Filter likuiditas
+MIN_VALUE_20D = 3_000_000_000           # Rp 3 miliar -> hard filter
+BONUS_VALUE_20D = 20_000_000_000        # Rp 20 miliar -> bonus skor volume
 
 # Rate-limit Yahoo Finance
 BATCH_SIZE = 10
-BATCH_PAUSE = 2.5                       # detik antar batch
+BATCH_PAUSE = 2.5
 MAX_RETRY = 3
 HISTORY_PERIOD = "6mo"
-MIN_BARS = 60                           # minimal bar agar indikator valid
-
-# Pemetaan sektor untuk Layer 4 (global)
-COMMODITY_SENSITIVE = {"TAMBANG", "ENERGI"}
-EXPORTERS = {"TAMBANG", "ENERGI", "AGRI"}
-IMPORTERS = {"KONSUMER", "TEKNOLOGI"}
-HIGH_BETA = {"TEKNOLOGI", "TAMBANG", "PROPERTI"}
+MIN_BARS = 60
 
 BIAS_VALUE = {"bullish": 100, "netral": 50, "bearish": 20}
 
@@ -84,7 +114,7 @@ def clamp(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
 
 
 # ===========================================================================
-# INDIKATOR DASAR (dihitung manual dari OHLCV)
+# INDIKATOR DASAR (manual, tanpa library 'ta')
 # ===========================================================================
 
 def ema(series: pd.Series, span: int) -> pd.Series:
@@ -152,6 +182,19 @@ def mfi(high, low, close, volume, period: int = 14) -> pd.Series:
     return (100 - 100 / (1 + pos / neg)).fillna(50)
 
 
+def atr(high, low, close, period: int = 14) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(),
+                    (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+
+def clv_series(high, low, close) -> pd.Series:
+    """Close Location Value per-bar, range -1..+1 (+1 = close di high)."""
+    rng = (high - low).replace(0, np.nan)
+    return (((close - low) - (high - close)) / rng).fillna(0.0)
+
+
 def swing_levels(high, low, price, left=2, right=2, lookback=60):
     """Support terdekat di bawah harga & resistance terdekat di atas harga."""
     h = high.tail(lookback).reset_index(drop=True)
@@ -169,276 +212,585 @@ def swing_levels(high, low, price, left=2, right=2, lookback=60):
     return support, resistance
 
 
-def slope_score(series: pd.Series, lookback: int = 5, max_pts: float = 25.0) -> float:
-    """Skor 0..max_pts dari kemiringan (slope) indikator, dinormalisasi volatilitas."""
-    if len(series) <= lookback:
-        return max_pts * 0.5
-    recent = float(series.iloc[-1] - series.iloc[-1 - lookback])
-    scale = float(series.diff().tail(20).abs().mean())
-    if not scale or np.isnan(scale):
-        return max_pts * 0.5
-    z = recent / (scale * lookback)
-    return float(max_pts / (1 + np.exp(-z)))      # logistik -> 0..max_pts
+def slope01(series: pd.Series, window: int = 20) -> float:
+    """Kemiringan series dinormalisasi ke 0..1 (0.5 = datar) via logistik."""
+    if len(series) <= window:
+        return 0.5
+    recent = float(series.iloc[-1] - series.iloc[-1 - window])
+    scale = float(series.diff().abs().tail(window).mean())
+    if not scale or np.isnan(scale) or scale <= 1e-12:
+        return 0.5
+    z = recent / (scale * window)
+    return float(1 / (1 + np.exp(-z)))
 
 
-# ===========================================================================
-# LAYER 1 — BANDARMOLOGY PROXY (skor 0-100)
-# ===========================================================================
+def pct_change_n(series: pd.Series, n: int) -> float:
+    if len(series) <= n:
+        return 0.0
+    prev = float(series.iloc[-1 - n])
+    if prev == 0:
+        return 0.0
+    return float(series.iloc[-1] / prev - 1)
 
-def layer_bandar(df: pd.DataFrame) -> dict:
+
+def value_20d_rp(close: pd.Series, volume: pd.Series) -> float:
+    return float((close * volume).rolling(20).mean().iloc[-1])
+
+
+def compute_indicators(df: pd.DataFrame) -> dict:
+    """Hitung sekali semua series dasar, dipakai bersama oleh semua skor."""
     close = df["Close"].astype(float)
     high = df["High"].astype(float)
     low = df["Low"].astype(float)
     volume = df["Volume"].astype(float)
-
-    obv_line = obv(close, volume)
-    adl_line = adl(high, low, close, volume)
-    mfi_now = float(mfi(high, low, close, volume).iloc[-1])
-
-    vol_avg = float(volume.rolling(20).mean().iloc[-1])
-    vol_ratio = float(volume.iloc[-1] / vol_avg) if vol_avg > 0 else 1.0
-    rng = float(high.iloc[-1] - low.iloc[-1])
-    clv = (((close.iloc[-1] - low.iloc[-1]) - (high.iloc[-1] - close.iloc[-1])) / rng
-           ) if rng > 0 else 0.0
-    price_up = bool(close.iloc[-1] > close.iloc[-2])
-
-    obv_up = bool(obv_line.iloc[-1] > obv_line.iloc[-5])
-    adl_up = bool(adl_line.iloc[-1] > adl_line.iloc[-5])
-
-    # Sub-skor (total maksimum 100)
-    s_obv = slope_score(obv_line, 5, 25)                 # 0..25
-    s_adl = slope_score(adl_line, 5, 25)                 # 0..25
-
-    if mfi_now < 20:                                     # oversold -> bonus reversal
-        s_mfi = 16.0
-    elif mfi_now < 50:
-        s_mfi = 6.0 + (mfi_now - 20) / 30 * 6            # 6..12
-    else:
-        s_mfi = 12.0 + min((mfi_now - 50) / 30, 1) * 8   # 12..20
-    s_mfi = clamp(s_mfi, 0, 20)
-
-    if vol_ratio >= 1.5:                                 # lonjakan volume = bandar aktif
-        s_vol = 15.0 if price_up else 6.0
-    elif vol_ratio >= 1.0:
-        base = 8.0 + (vol_ratio - 1.0) / 0.5 * 4         # 8..12
-        s_vol = base if price_up else base * 0.5
-    else:
-        s_vol = 5.0 if price_up else 3.0
-    s_vol = clamp(s_vol, 0, 15)
-
-    s_clv = clamp((clv + 1) / 2 * 15, 0, 15)             # 0..15
-
-    score = clamp(s_obv + s_adl + s_mfi + s_vol + s_clv, 0, 100)
-
-    arah = "↑" if (obv_up and adl_up) else ("↓" if (not obv_up and not adl_up) else "→")
-    if score >= 60:
-        status = "AKUMULASI"
-    elif score <= 40:
-        status = "DISTRIBUSI"
-    else:
-        status = "NETRAL"
-
-    return {
-        "skor_bandar": round(score, 1),
-        "bandar_status": status,
-        "bandar_arah": arah,
-        "obv_up": obv_up, "adl_up": adl_up,
-        "mfi": round(mfi_now, 1), "vol_ratio": round(vol_ratio, 2),
-        "clv": round(clv, 2),
-    }
-
-
-# ===========================================================================
-# LAYER 2 — TEKNIKAL (skor 0-100)
-# ===========================================================================
-
-def layer_teknikal(df: pd.DataFrame) -> dict:
-    close = df["Close"].astype(float)
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
-
-    ema20 = float(ema(close, 20).iloc[-1])
-    ema50 = float(ema(close, 50).iloc[-1])
-    rsi_s = rsi(close, 14)
-    rsi_now, rsi_prev = float(rsi_s.iloc[-1]), float(rsi_s.iloc[-2])
-    sar_now = float(parabolic_sar(high, low).iloc[-1])
-    _, _, hist = macd(close)
-    hist_now, hist_prev = float(hist.iloc[-1]), float(hist.iloc[-2])
     price = float(close.iloc[-1])
+    _, _, hist = macd(close)
     support, resistance = swing_levels(high, low, price)
+    return {
+        "close": close, "high": high, "low": low, "volume": volume, "price": price,
+        "ema20": ema(close, 20), "ema50": ema(close, 50),
+        "rsi": rsi(close, 14), "macd_hist": hist,
+        "sar": parabolic_sar(high, low),
+        "obv": obv(close, volume), "adl": adl(high, low, close, volume),
+        "mfi": mfi(high, low, close, volume), "atr": atr(high, low, close),
+        "clv": clv_series(high, low, close),
+        "avgvol20": volume.rolling(20).mean(),
+        "avgrange20": (high - low).rolling(20).mean(),
+        "support": support, "resistance": resistance,
+    }
 
-    # EMA (maks 25): di atas EMA20 +12, di atas EMA50 +13
-    s_ema = (12 if price > ema20 else 0) + (13 if price > ema50 else 0)
 
-    # RSI (maks 20)
-    rising = rsi_now > rsi_prev
-    if 40 <= rsi_now <= 65:
-        s_rsi = 16 + (4 if rising else 0)
+# ===========================================================================
+# SKOR 1 — AKUMULASI (40%, proxy)
+# ===========================================================================
+
+def score_akumulasi(ind: dict) -> dict:
+    close, volume, atr_s, clv_s, mfi_s = (ind["close"], ind["volume"],
+                                          ind["atr"], ind["clv"], ind["mfi"])
+    adl_s, obv_s = ind["adl"], ind["obv"]
+
+    # (a) ADL slope 20 hari
+    sub_adl = slope01(adl_s, 20) * 25
+
+    # (b) OBV slope 20 hari + divergensi vs harga (OBV naik, harga sideways)
+    obv_sl, price_sl = slope01(obv_s, 20), slope01(close, 20)
+    sub_obv = obv_sl * 15
+    divergence = obv_sl > 0.6 and abs(price_sl - 0.5) < 0.15
+    if divergence:
+        sub_obv += 10
+    sub_obv = clamp(sub_obv, 0, 25)
+
+    # (c) Range contraction (ATR menurun = absorpsi supply)
+    atr_now = float(atr_s.iloc[-1])
+    atr_prev = float(atr_s.iloc[-21]) if len(atr_s) > 21 else atr_now
+    contraction_ratio = atr_now / atr_prev if atr_prev > 0 else 1.0
+    range_contraction = contraction_ratio < 0.85
+    sub_range = clamp((1 - contraction_ratio) / 0.5 * 15, 0, 15)
+
+    # (d) CLV rata-rata 10 hari (>0.3 = serapan beli konsisten)
+    clv_avg10 = float(clv_s.tail(10).mean())
+    sub_clv = clamp((clv_avg10 + 1) / 2 * 15, 0, 15)
+
+    # (e) MFI 14 stabil di area 40-60 (dana masuk tanpa euforia)
+    mfi_recent = mfi_s.tail(10)
+    frac_stable = float(((mfi_recent >= 40) & (mfi_recent <= 60)).mean())
+    sub_mfi = frac_stable * 10
+
+    # (f) Lower-wick frequency 20 hari: close >60% dari range (clv > 0.2)
+    #     -> proxy shakeout & rebound (spring)
+    spring_freq = float((clv_s.tail(20) > 0.2).mean())
+    sub_spring = spring_freq * 10
+
+    score = sub_adl + sub_obv + sub_range + sub_clv + sub_mfi + sub_spring
+
+    # --- Bonus pola "akumulasi matang" ---
+    notes = []
+    rng20 = float(close.tail(20).max() - close.tail(20).min())
+    sideways_rising_vol = (rng20 / close.iloc[-1] < 0.15) and slope01(volume, 10) > 0.6
+    if sideways_rising_vol:
+        score += 4
+        notes.append("sideways 20 hari + volume naik bertahap")
+
+    # shakeout = hari bikin low 20-hari baru tapi close rebound ke atas open proxy
+    low20 = ind["low"].tail(20)
+    rolling_min = low20.cummin().shift(1)
+    open_proxy = (ind["high"] + ind["low"]) / 2
+    shakeout_count = int(((low20 < rolling_min) & (close.tail(20) > open_proxy.tail(20))).sum())
+    if 1 <= shakeout_count <= 2:
+        score += 3
+        notes.append(f"{shakeout_count} hari shakeout (low baru, close rebound)")
+
+    mfi_bull_div = False
+    if len(close) > 16:
+        win_close, win_mfi = close.tail(15), mfi_s.tail(15)
+        idx_min = win_close.idxmin()
+        if idx_min != win_close.index[-1]:
+            price_ll = close.iloc[-1] <= float(win_close.loc[idx_min]) * 1.01
+            mfi_higher = float(mfi_s.iloc[-1]) > float(win_mfi.loc[idx_min])
+            mfi_bull_div = price_ll and mfi_higher
+    if mfi_bull_div:
+        score += 3
+        notes.append("divergensi bullish MFI vs harga")
+
+    score = clamp(score, 0, 100)
+    if range_contraction:
+        notes.insert(0, f"range contraction (ATR {contraction_ratio:.2f}x)")
+    if clv_avg10 > 0.3:
+        notes.insert(0, f"CLV rata-rata 10d {clv_avg10:.2f} (serapan beli)")
+
+    return {
+        "skor_akumulasi": round(score, 1),
+        "_range_contraction": range_contraction,
+        "_sideways_rising_vol": sideways_rising_vol,
+        "_shakeout_count": shakeout_count,
+        "_mfi_bull_div": mfi_bull_div,
+        "_notes_akumulasi": notes,
+    }
+
+
+# ===========================================================================
+# SKOR 2 — SMART MONEY (25%, proxy OHLCV)
+# ===========================================================================
+
+def score_smart_money(ind: dict) -> dict:
+    close, high, low, volume = ind["close"], ind["high"], ind["low"], ind["volume"]
+    avgvol20, avgrange20, clv_s, atr_s = (ind["avgvol20"], ind["avgrange20"],
+                                          ind["clv"], ind["atr"])
+    notes = []
+
+    # (a) Volume climax di area low: vol >3x avg20 & low dekat rolling-min
+    climax_count = 0
+    tail_n = min(15, len(close))
+    roll_low20 = low.rolling(20).min()
+    for i in range(len(close) - tail_n, len(close)):
+        if i < 20:
+            continue
+        if volume.iloc[i] > 3 * avgvol20.iloc[i] and low.iloc[i] <= roll_low20.iloc[i] * 1.02:
+            climax_count += 1
+    sub_climax = clamp(climax_count, 0, 2) / 2 * 20
+    if climax_count:
+        notes.append(f"{climax_count} hari volume climax dekat area low")
+
+    # (b) Effort vs result: volume besar tapi range kecil = absorpsi
+    absorption_days = 0
+    for i in range(len(close) - 10, len(close)):
+        if i < 20:
+            continue
+        if volume.iloc[i] > 1.5 * avgvol20.iloc[i] and (high.iloc[i] - low.iloc[i]) < 0.7 * avgrange20.iloc[i]:
+            absorption_days += 1
+    sub_effort = clamp(absorption_days, 0, 3) / 3 * 20
+    if absorption_days:
+        notes.append(f"{absorption_days} hari absorpsi (volume besar, range kecil)")
+
+    # (c) Strong close: close di 30% atas range (clv > 0.4), >5 dari 10 hari
+    strong_count = int((clv_s.tail(10) > 0.4).sum())
+    sub_strongclose = clamp(strong_count / 10, 0, 1) * 20
+    if strong_count > 5:
+        notes.append(f"strong close {strong_count}/10 hari")
+
+    # (d) No supply test: ATR & volume sama-sama menurun 5 hari terakhir
+    atr_down = len(atr_s) > 6 and float(atr_s.iloc[-1]) < float(atr_s.iloc[-6])
+    vol_down = volume.tail(5).mean() < volume.tail(10).mean()
+    sub_nosupply = 15 if (atr_down and vol_down) else (7 if (atr_down or vol_down) else 0)
+    if atr_down and vol_down:
+        notes.append("no-supply: ATR & volume menurun")
+
+    # (e) Sign of strength: hari naik, volume > avg20, close kuat
+    up_today = bool(close.iloc[-1] > close.iloc[-2])
+    vol_above = bool(volume.iloc[-1] > avgvol20.iloc[-1])
+    strong_today = bool(clv_s.iloc[-1] > 0.4)
+    n_true = sum([up_today, vol_above, strong_today])
+    sub_sos = 15 if n_true == 3 else (8 if n_true == 2 else 0)
+    if n_true == 3:
+        notes.append("sign of strength hari ini")
+
+    # (f) Down-day volume drying: volume turun lebih kecil di hari merah
+    ret = close.diff()
+    down_vol = volume[ret < 0].tail(10)
+    up_vol = volume[ret > 0].tail(10)
+    sub_dryup = 0.0
+    if len(down_vol) and len(up_vol):
+        ratio = float(down_vol.mean() / up_vol.mean())
+        if ratio < 1:
+            sub_dryup = clamp(1 - ratio, 0, 1) * 10
+            if sub_dryup > 5:
+                notes.append("volume hari merah mengecil (supply mengering)")
+
+    score = clamp(sub_climax + sub_effort + sub_strongclose + sub_nosupply
+                  + sub_sos + sub_dryup, 0, 100)
+
+    return {"skor_smart_money": round(score, 1), "_notes_smart_money": notes}
+
+
+# ===========================================================================
+# SKOR 3 — FOREIGN FLOW (15%, PROXY — bukan data asing asli, verifikasi RTI)
+# ===========================================================================
+
+def score_foreign_flow(ind: dict, ihsg_close: pd.Series | None) -> dict:
+    close, volume = ind["close"], ind["volume"]
+    notes = []
+
+    # (a) Volume sesi penutupan (proxy): candle terakhir vs avg5 sebelumnya
+    avg5_prev = float(volume.rolling(5).mean().iloc[-2]) if len(volume) > 6 else float(volume.mean())
+    ratio_last = float(volume.iloc[-1] / avg5_prev) if avg5_prev > 0 else 1.0
+    up_today = bool(close.iloc[-1] > close.iloc[-2])
+    if ratio_last > 1.3 and up_today:
+        sub_close = 25.0
+        notes.append("volume closing besar + harga naik")
+    elif ratio_last > 1.3:
+        sub_close = 15.0
+    elif ratio_last > 1.0:
+        sub_close = 10.0
+    else:
+        sub_close = 5.0
+
+    # (b) Konsistensi green close + volume meningkat, 5 hari terakhir
+    ret = close.diff()
+    cnt = 0
+    for i in range(len(close) - 5, len(close)):
+        if i < 1:
+            continue
+        if ret.iloc[i] > 0 and volume.iloc[i] > volume.iloc[i - 1]:
+            cnt += 1
+    sub_consistency = cnt / 5 * 25
+    if cnt >= 4:
+        notes.append(f"{cnt}/5 hari green close + volume naik")
+
+    # (c) Relative strength vs IHSG 10 hari
+    if ihsg_close is not None and len(ihsg_close) > 11:
+        rs = pct_change_n(close, 10) - pct_change_n(ihsg_close, 10)
+        sub_rs = 30 / (1 + np.exp(-rs / 0.03))
+        if rs > 0.02:
+            notes.append(f"outperform IHSG {rs*100:+.1f}% (10d)")
+        elif rs < -0.02:
+            notes.append(f"underperform IHSG {rs*100:+.1f}% (10d)")
+    else:
+        sub_rs = 15.0  # netral, data IHSG tidak tersedia
+
+    # (d) Money flow positif (typical price naik) dalam 10 hari
+    tp = (ind["high"] + ind["low"] + close) / 3
+    mf_pos = (tp.diff() > 0).tail(10)
+    cnt_pos = int(mf_pos.sum())
+    sub_mf = cnt_pos / 10 * 20
+    if cnt_pos == 10:
+        notes.append("10 hari money-flow positif berturut-turut")
+
+    score = clamp(sub_close + sub_consistency + sub_rs + sub_mf, 0, 100)
+    return {"skor_foreign_flow": round(score, 1), "_notes_foreign": notes}
+
+
+# ===========================================================================
+# SKOR 4 — VOLUME (10%)
+# ===========================================================================
+
+def score_volume(ind: dict, value_20d: float) -> dict:
+    close, volume, avgvol20 = ind["close"], ind["volume"], ind["avgvol20"]
+    notes = []
+    up_today = bool(close.iloc[-1] > close.iloc[-2])
+
+    # (a) volume hari ini vs avg5 sebelumnya
+    avg5_prev = float(volume.rolling(5).mean().iloc[-2]) if len(volume) > 6 else float(volume.mean())
+    ratio5 = float(volume.iloc[-1] / avg5_prev) if avg5_prev > 0 else 1.0
+    sub_a = 20 if ratio5 >= 1.5 else (10 if ratio5 >= 1.0 else 5)
+
+    # (b) volume hari ini vs avg20
+    ratio20 = float(volume.iloc[-1] / avgvol20.iloc[-1]) if avgvol20.iloc[-1] > 0 else 1.0
+    if ratio20 >= 2:
+        sub_b = 25
+    elif ratio20 >= 1.5:
+        sub_b = 15
+    elif ratio20 >= 1:
+        sub_b = 8
+    else:
+        sub_b = 3
+    if ratio20 >= 1.5:
+        notes.append(f"volume {ratio20:.1f}x avg20")
+
+    # (c) tren volume naik 5-10 hari
+    sub_c = slope01(volume, 10) * 20
+
+    # (d) volume climax >4x avg -> bisa exhaustion
+    climax = ratio20 >= 4
+    if climax:
+        sub_d = 10 if up_today else 4
+        notes.append("volume climax >4x avg - waspada exhaustion")
+    else:
+        sub_d = 8
+
+    # (e) volume naik di hari naik (10 hari terakhir)
+    ret = close.diff()
+    up_days = ret.tail(10) > 0
+    if up_days.any():
+        sub_e = float((volume.tail(10)[up_days] > avgvol20.tail(10)[up_days]).mean()) * 15
+    else:
+        sub_e = 0.0
+
+    # (f) volume turun di hari turun (supply mengering)
+    down_days = ret.tail(10) < 0
+    if down_days.any():
+        sub_f = float((volume.tail(10)[down_days] < avgvol20.tail(10)[down_days]).mean()) * 10
+    else:
+        sub_f = 5.0
+
+    score = sub_a + sub_b + sub_c + sub_d + sub_e + sub_f
+
+    # Bonus likuiditas besar
+    if value_20d > BONUS_VALUE_20D:
+        score += 5
+        notes.append(f"likuiditas besar (value20d Rp{value_20d/1e9:.1f}M, bonus +5)")
+
+    return {"skor_volume": round(clamp(score, 0, 100), 1), "_notes_volume": notes}
+
+
+# ===========================================================================
+# SKOR 5 — MOMENTUM (10%), fokus swing 1-10 hari
+# ===========================================================================
+
+def score_momentum(ind: dict) -> dict:
+    close, high = ind["close"], ind["high"]
+    price = ind["price"]
+    ema20, ema50 = ind["ema20"], ind["ema50"]
+    rsi_s, hist = ind["rsi"], ind["macd_hist"]
+    notes = []
+
+    rsi_now, rsi_prev = float(rsi_s.iloc[-1]), float(rsi_s.iloc[-2])
+    ema20_now, ema50_now = float(ema20.iloc[-1]), float(ema50.iloc[-1])
+    hist_now, hist_prev = float(hist.iloc[-1]), float(hist.iloc[-2])
+
+    # (a) RSI 45-65 dan naik
+    if 45 <= rsi_now <= 65 and rsi_now > rsi_prev:
+        sub_a = 20
+        notes.append(f"RSI {rsi_now:.0f} di zona sehat & naik")
+    elif 45 <= rsi_now <= 65:
+        sub_a = 12
     elif rsi_now < 30:
-        s_rsi = 14                                       # bonus reversal oversold
-    elif 30 <= rsi_now < 40:
-        s_rsi = 10 + (2 if rising else 0)
-    elif 65 < rsi_now <= 75:
-        s_rsi = 10
-    else:                                                # >75 overbought = penalti
-        s_rsi = 4
-    s_rsi = clamp(s_rsi, 0, 20)
+        sub_a = 8
+    else:
+        sub_a = 4
 
-    # Parabolic SAR (maks 15)
-    s_sar = 15 if sar_now < price else 0
-
-    # MACD (maks 20)
-    if hist_now > hist_prev and hist_prev <= 0 < hist_now:
-        s_macd = 20                                      # fresh cross up
+    # (b) MACD histogram positif & membesar
+    if hist_now > 0 and hist_now > hist_prev:
+        sub_b = 20
+        notes.append("MACD histogram positif & membesar")
     elif hist_now > 0:
-        s_macd = 15
+        sub_b = 12
     elif hist_now > hist_prev:
-        s_macd = 10                                      # masih negatif tapi membaik
+        sub_b = 8
     else:
-        s_macd = 3
-    s_macd = clamp(s_macd, 0, 20)
+        sub_b = 0
 
-    # Posisi terhadap support-resistance (maks 20): dekat support = upside besar
-    if resistance > support:
-        pos = (price - support) / (resistance - support)
+    # (c) harga di atas EMA20 & EMA20 di atas EMA50
+    above20, above50 = price > ema20_now, ema20_now > ema50_now
+    if above20 and above50:
+        sub_c = 20
+        notes.append("harga > EMA20 > EMA50")
+    elif above20:
+        sub_c = 10
     else:
-        pos = 0.5
-    if pos > 1:                                          # breakout di atas resistance
-        s_sr = 10
-    else:
-        s_sr = clamp((1 - pos), 0, 1) * 20
+        sub_c = 0
 
-    score = clamp(s_ema + s_rsi + s_sar + s_macd + s_sr, 0, 100)
+    # (d) slope EMA20 5 hari positif
+    ema20_slope_pos = len(ema20) > 6 and ema20.iloc[-1] > ema20.iloc[-6]
+    sub_d = 15 if ema20_slope_pos else 0
+
+    # (e) posisi harga terhadap range 20 hari (atas 50% lebih baik)
+    low20, high20 = ind["low"].tail(20).min(), high.tail(20).max()
+    pos20 = (price - low20) / (high20 - low20) if high20 > low20 else 0.5
+    sub_e = clamp(pos20, 0, 1) * 25
+
+    score = sub_a + sub_b + sub_c + sub_d + sub_e
+
+    # --- Penalti: telat / overbought / mentok resistance ---
+    if rsi_now > 75:
+        score -= 15
+        notes.append("RSI >75 overbought - berisiko telat")
+
+    run10 = pct_change_n(close, 10)
+    if run10 > 0.25:
+        score -= 15
+        notes.append(f"harga sudah naik {run10*100:.0f}% dlm 10 hari - sudah lari")
+
+    if len(high) >= 60:
+        high60 = float(high.tail(60).max())
+        if high60 * 0.98 <= price < high60:
+            score -= 10
+            notes.append("mentok resistance jangka panjang, belum breakout")
 
     return {
-        "skor_teknikal": round(score, 1),
-        "harga": round(price, 2),
-        "ema20": round(ema20, 2), "ema50": round(ema50, 2),
-        "rsi": round(rsi_now, 1), "sar": round(sar_now, 2),
-        "macd_hist": round(hist_now, 4),
-        "support": round(support, 2), "resistance": round(resistance, 2),
-        "_above_ema20": price > ema20, "_above_ema50": price > ema50,
-        "_macd_pts": s_macd, "_sar_ok": sar_now < price,
+        "skor_momentum": round(clamp(score, 0, 100), 1),
+        "_above_ema20": above20, "_above_ema50_chain": above20 and above50,
+        "_ema20_above_ema50": above50,
+        "_ema20_slope_pos": ema20_slope_pos,
+        "_notes_momentum": notes,
     }
 
 
 # ===========================================================================
-# LAYER 3 & 4 — MACRO (dari macro.txt)
+# SKOR 6 — RISIKO DISTRIBUSI (penalti 20%)
 # ===========================================================================
 
-def layer_macro_id(macro: dict, sektor: str) -> dict:
-    ihsg = BIAS_VALUE.get(macro.get("IHSG_BIAS", "netral"), 50)
-    sec_bias = macro.get(f"SEKTOR_{sektor}", "netral")
-    sec_val = BIAS_VALUE.get(sec_bias, 50)
-    return {"skor_macro_id": round((ihsg + sec_val) / 2, 1),
-            "_ihsg": macro.get("IHSG_BIAS", "netral"),
-            "_sektor_bias": sec_bias}
+def score_risiko_distribusi(ind: dict) -> dict:
+    close, high, volume = ind["close"], ind["high"], ind["volume"]
+    clv_s, mfi_s, adl_s, avgvol20 = ind["clv"], ind["mfi"], ind["adl"], ind["avgvol20"]
+    notes = []
 
+    # (a) Upper-wick frequency 10 hari (close jauh di bawah high, clv < -0.2)
+    sub_a = float((clv_s.tail(10) < -0.2).mean()) * 20
+    if sub_a > 10:
+        notes.append("upper-wick sering muncul (supply di atas)")
 
-def layer_global(macro: dict, sektor: str) -> dict:
-    usd = macro.get("USD_IDR", "netral")        # bullish = rupiah kuat
-    kom = macro.get("KOMODITAS", "netral")
-    risk = macro.get("RISK_SENTIMENT", "netral")
-    s = 50.0
-
-    # Komoditas
-    if sektor in COMMODITY_SENSITIVE:
-        s += {"bullish": 20, "netral": 0, "bearish": -20}.get(kom, 0)
+    # (b) Volume naik saat harga turun (10 hari)
+    ret = close.diff()
+    down_days = ret.tail(10) < 0
+    if down_days.any():
+        sub_b = float((volume.tail(10)[down_days] > avgvol20.tail(10)[down_days]).mean()) * 20
     else:
-        s += {"bullish": 3, "netral": 0, "bearish": -3}.get(kom, 0)
+        sub_b = 0.0
+    if sub_b > 10:
+        notes.append("volume naik di hari turun (distribusi)")
 
-    # USD/IDR
-    if sektor in EXPORTERS:                     # rupiah lemah (bearish) untungkan eksportir
-        s += {"bullish": -10, "netral": 0, "bearish": 12}.get(usd, 0)
-    elif sektor in IMPORTERS:                    # rupiah lemah penalti importir
-        s += {"bullish": 10, "netral": 0, "bearish": -12}.get(usd, 0)
+    # (c) Lower highs 10 hari terakhir (paruh kedua < paruh pertama)
+    h10 = high.tail(10)
+    prior_high = float(h10.head(5).max())
+    recent_high = float(h10.tail(5).max())
+    lower_highs = recent_high < prior_high
+    sub_c = 20 if lower_highs else 0
+    if lower_highs:
+        notes.append("lower highs 10 hari terakhir")
 
-    # Risk sentiment
-    amt = 18 if sektor in HIGH_BETA else 12
-    s += {"risk_on": amt, "netral": 0, "risk_off": -amt}.get(risk, 0)
+    # (d) MFI overbought >80 dlm 10 hari lalu turun <70 sekarang
+    was_ob = bool((mfi_s.tail(10) > 80).any())
+    now_below = float(mfi_s.iloc[-1]) < 70
+    sub_d = 20 if (was_ob and now_below) else 0
+    if sub_d:
+        notes.append("MFI turun dari overbought (>80 -> <70)")
 
-    return {"skor_global": round(clamp(s, 0, 100), 1),
-            "_usd": usd, "_kom": kom, "_risk": risk}
+    # (e) ADL turun saat harga naik (bearish divergence)
+    price_sl, adl_sl = slope01(close, 10), slope01(adl_s, 10)
+    bearish_div = price_sl > 0.6 and adl_sl < 0.4
+    sub_e = 20 if bearish_div else 0
+    if bearish_div:
+        notes.append("ADL turun saat harga naik (divergensi bearish)")
 
-
-# ===========================================================================
-# GABUNG SKOR + ALASAN
-# ===========================================================================
-
-def build_reason(b: dict, t: dict, m: dict, g: dict, sektor: str) -> str:
-    parts = []
-    # Bandar
-    obv_adl = f"OBV{'↑' if b['obv_up'] else '↓'}/ADL{'↑' if b['adl_up'] else '↓'}"
-    vol = f", vol {b['vol_ratio']}x" if b["vol_ratio"] >= 1.5 else ""
-    parts.append(f"Bandar {b['bandar_status']}{b['bandar_arah']} "
-                 f"({obv_adl}, MFI {b['mfi']:.0f}{vol})")
-    # Teknikal
-    tek = []
-    if t["_above_ema20"] and t["_above_ema50"]:
-        tek.append("di atas EMA20&50")
-    elif t["_above_ema20"]:
-        tek.append("di atas EMA20")
-    else:
-        tek.append("di bawah EMA20")
-    tek.append(f"RSI {t['rsi']:.0f}")
-    if t["_macd_pts"] >= 15:
-        tek.append("MACD bullish")
-    if t["_sar_ok"]:
-        tek.append("SAR di bawah")
-    parts.append("Teknikal: " + ", ".join(tek))
-    # Macro
-    parts.append(f"Sektor {sektor} {m['_sektor_bias']}, IHSG {m['_ihsg']}")
-    if g["_kom"] != "netral" and sektor in COMMODITY_SENSITIVE:
-        parts.append(f"komoditas {g['_kom']}")
-    if g["_risk"] != "netral":
-        parts.append(f"risk {g['_risk']}")
-    return "; ".join(parts)
-
-
-def score_stock(df: pd.DataFrame, sektor: str, macro: dict) -> dict:
-    b = layer_bandar(df)
-    t = layer_teknikal(df)
-    m = layer_macro_id(macro, sektor)
-    g = layer_global(macro, sektor)
-
-    skor_akhir = (b["skor_bandar"] * W_BANDAR +
-                  t["skor_teknikal"] * W_TEKNIKAL +
-                  m["skor_macro_id"] * W_MACRO_ID +
-                  g["skor_global"] * W_GLOBAL)
-
-    price = t["harga"]
-    entry = price
-    sl = round(entry * 0.97, 2)                          # -3%
-    tp = t["resistance"] if t["resistance"] > entry else round(entry * 1.05, 2)
-
+    score = clamp(sub_a + sub_b + sub_c + sub_d + sub_e, 0, 100)
     return {
-        "skor_akhir": round(skor_akhir, 1),
-        "sektor": sektor,
-        **{k: b[k] for k in ("skor_bandar", "bandar_status", "bandar_arah",
-                             "mfi", "vol_ratio", "clv")},
-        **{k: t[k] for k in ("skor_teknikal", "harga", "ema20", "ema50",
-                             "rsi", "sar", "macd_hist", "support", "resistance")},
-        "skor_macro_id": m["skor_macro_id"],
-        "skor_global": g["skor_global"],
-        "entry": entry, "sl": sl, "tp": tp,
-        "alasan": build_reason(b, t, m, g, sektor),
+        "skor_risiko_distribusi": round(score, 1),
+        "_lower_highs": lower_highs,
+        "_notes_risiko": notes,
     }
 
 
 # ===========================================================================
-# PEMBACAAN FILE KONFIGURASI
+# KLASIFIKASI FASE WYCKOFF & FINAL SCORE
+# ===========================================================================
+
+def classify_phase(akum, vol, mom, risiko, rsi_now, range_contraction,
+                   lower_highs, above_ema20) -> str:
+    # Distribusi diprioritaskan (peringatan)
+    if risiko > 70 and lower_highs:
+        return "Distribusi Matang"
+    if risiko > 50 and rsi_now > 70:
+        return "Distribusi Awal"
+    if mom > 70 and above_ema20:
+        return "Markup Kuat"
+    if akum > 65 and 50 <= mom <= 70 and above_ema20:
+        return "Markup Awal"
+    if akum > 70 and vol >= 50 and range_contraction:
+        return "Akumulasi Matang"
+    if 50 <= akum <= 70 and vol < 50 and mom < 40:
+        return "Akumulasi Awal"
+    return "Netral"
+
+
+def classify_score(final: float) -> tuple:
+    """Return (label, bintang) berdasarkan Final Score."""
+    if final >= 90:
+        return "SANGAT SIAP MARKUP", "⭐⭐⭐"
+    if final >= 80:
+        return "SIAP MARKUP", "⭐⭐"
+    if final >= 70:
+        return "WATCHLIST PRIORITAS", "⭐"
+    if final >= 60:
+        return "PERLU KONFIRMASI", "⚠️"
+    return "HINDARI", ""
+
+
+def build_alasan(phase, a, sm, ff, vol, mom, risiko) -> str:
+    """Gabung catatan tiap layer jadi satu kalimat audit singkat."""
+    bits = []
+    if a["_notes_akumulasi"]:
+        bits.append("; ".join(a["_notes_akumulasi"][:3]))
+    if sm["_notes_smart_money"]:
+        bits.append("; ".join(sm["_notes_smart_money"][:2]))
+    if mom["_notes_momentum"]:
+        bits.append("; ".join(mom["_notes_momentum"][:2]))
+    if risiko["_notes_risiko"]:
+        bits.append("Risiko: " + "; ".join(risiko["_notes_risiko"][:2]))
+    foreign = "Foreign proxy " + ("bullish" if ff["skor_foreign_flow"] >= 55
+                                  else "netral/lemah") + " (verifikasi RTI)"
+    bits.append(foreign)
+    text = f"[{phase}] " + ". ".join(b for b in bits if b)
+    return text[:300]
+
+
+def score_stock(df: pd.DataFrame, sektor: str, ihsg_close, value_20d: float) -> dict:
+    ind = compute_indicators(df)
+
+    a = score_akumulasi(ind)
+    sm = score_smart_money(ind)
+    ff = score_foreign_flow(ind, ihsg_close)
+    vol = score_volume(ind, value_20d)
+    mom = score_momentum(ind)
+    risiko = score_risiko_distribusi(ind)
+
+    final = (a["skor_akumulasi"] * W_AKUMULASI
+             + sm["skor_smart_money"] * W_SMARTMONEY
+             + ff["skor_foreign_flow"] * W_FOREIGN
+             + vol["skor_volume"] * W_VOLUME
+             + mom["skor_momentum"] * W_MOMENTUM
+             - risiko["skor_risiko_distribusi"] * W_RISIKO)
+    final = clamp(final, 0, 100)
+
+    rsi_now = float(ind["rsi"].iloc[-1])
+    phase = classify_phase(a["skor_akumulasi"], vol["skor_volume"],
+                           mom["skor_momentum"], risiko["skor_risiko_distribusi"],
+                           rsi_now, a["_range_contraction"],
+                           risiko["_lower_highs"], mom["_above_ema20"])
+    label, bintang = classify_score(final)
+
+    price = ind["price"]
+    entry = round(price, 2)
+    sl = round(entry * 0.97, 2)
+    tp = ind["resistance"] if ind["resistance"] > entry else round(entry * 1.05, 2)
+    change_pct = round(pct_change_n(ind["close"], 1) * 100, 2)
+    alasan = build_alasan(phase, a, sm, ff, vol, mom, risiko)
+
+    return {
+        "Sektor": sektor, "Harga": entry, "Change%": change_pct,
+        "Value_20d_Rp": round(value_20d),
+        "Skor_Akumulasi": a["skor_akumulasi"],
+        "Skor_SmartMoney": sm["skor_smart_money"],
+        "Skor_ForeignFlow_PROXY": ff["skor_foreign_flow"],
+        "Skor_Volume": vol["skor_volume"],
+        "Skor_Momentum": mom["skor_momentum"],
+        "RisikoDistribusi": risiko["skor_risiko_distribusi"],
+        "Final_Score": round(final, 1),
+        "Klasifikasi": label, "Bintang": bintang,
+        "Fase_Wyckoff": phase,
+        "Entry": entry, "SL_3pct": sl, "TP_resistance": tp,
+        "Alasan": alasan,
+    }
+
+
+# ===========================================================================
+# FILE KONFIGURASI
 # ===========================================================================
 
 def read_lines(path: str) -> list:
     if not os.path.exists(path):
         return []
     with open(path, encoding="utf-8") as fh:
-        out = []
-        for line in fh:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                out.append(line)
-        return out
+        return [ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")]
 
 
 def load_top100() -> list:
@@ -463,9 +815,18 @@ def load_macro() -> dict:
         if "=" in line:
             k, v = line.split("=", 1)
             out[k.strip().upper()] = v.strip().lower()
-    if not out:
-        print(f"[WARN] {MACRO_FILE} tidak ada/kosong -> semua makro dianggap netral.")
     return out
+
+
+def macro_context_line(macro: dict) -> str:
+    if not macro:
+        return "🌐 Makro: (macro.txt kosong) — konteks saja, tidak memengaruhi skor"
+    ihsg = macro.get("IHSG_BIAS", "netral")
+    usd = macro.get("USD_IDR", "netral")
+    kom = macro.get("KOMODITAS", "netral")
+    risk = macro.get("RISK_SENTIMENT", "netral")
+    return (f"🌐 Konteks makro (info saja): IHSG {ihsg} | USD/IDR {usd} | "
+            f"Komoditas {kom} | Risk {risk}")
 
 
 # ===========================================================================
@@ -473,7 +834,6 @@ def load_macro() -> dict:
 # ===========================================================================
 
 def fetch_batch(codes: list, period: str = HISTORY_PERIOD) -> dict:
-    """Unduh satu batch ticker. Return {code: DataFrame OHLCV} yang berhasil."""
     import yfinance as yf
     tickers = [f"{c}.JK" for c in codes]
     data = yf.download(tickers, period=period, interval="1d", progress=False,
@@ -497,7 +857,6 @@ def chunks(seq: list, size: int):
 
 
 def download_all(codes: list) -> tuple:
-    """Unduh semua ticker per batch dengan retry. Return (data_map, gagal_list)."""
     data_map, gagal = {}, []
     batches = list(chunks(codes, BATCH_SIZE))
     for bi, batch in enumerate(batches, 1):
@@ -514,15 +873,29 @@ def download_all(codes: list) -> tuple:
                 break
             if attempt < MAX_RETRY:
                 wait = BATCH_PAUSE * attempt
-                print(f"  batch {bi}: {len(remaining)} gagal, retry {attempt+1} "
-                      f"dalam {wait:.0f}s -> {remaining}")
+                print(f"  batch {bi}: {len(remaining)} gagal, retry {attempt+1} dalam {wait:.0f}s")
                 time.sleep(wait)
         if remaining:
             gagal.extend(remaining)
-        print(f"[batch {bi}/{len(batches)}] ok={len(batch)-len([c for c in batch if c in gagal])} "
-              f"gagal={[c for c in batch if c in gagal]}")
+        ok = len(batch) - len([c for c in batch if c in gagal])
+        print(f"[batch {bi}/{len(batches)}] ok={ok} gagal={[c for c in batch if c in gagal]}")
         time.sleep(BATCH_PAUSE)
     return data_map, gagal
+
+
+def fetch_ihsg():
+    try:
+        import yfinance as yf
+        df = yf.download(IHSG_TICKER, period="3mo", interval="1d",
+                         progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        return df["Close"].astype(float)
+    except Exception as exc:                             # noqa: BLE001
+        print(f"[WARN] gagal ambil IHSG (RS pakai netral): {exc}")
+        return None
 
 
 # ===========================================================================
@@ -534,47 +907,56 @@ def fmt(value: float) -> str:
 
 
 CSV_COLUMNS = [
-    "tanggal", "jam", "ticker", "sektor", "skor_akhir",
-    "skor_bandar", "bandar_status", "bandar_arah",
-    "skor_teknikal", "skor_macro_id", "skor_global",
-    "harga", "entry", "sl", "tp",
-    "rsi", "mfi", "vol_ratio", "clv", "ema20", "ema50",
-    "sar", "macd_hist", "support", "resistance", "alasan",
+    "Tanggal", "Jam", "Ticker", "Sektor", "Harga", "Change%", "Value_20d_Rp",
+    "Skor_Akumulasi", "Skor_SmartMoney", "Skor_ForeignFlow_PROXY",
+    "Skor_Volume", "Skor_Momentum", "RisikoDistribusi",
+    "Final_Score", "Klasifikasi", "Fase_Wyckoff",
+    "Entry", "SL_3pct", "TP_resistance", "Alasan",
 ]
 
 
 def save_csv(rows: list, path: str = RANKING_CSV):
     if not rows:
-        print("[WARN] tidak ada baris untuk disimpan ke CSV.")
+        print("[WARN] tidak ada baris untuk CSV.")
         return
     df = pd.DataFrame(rows)
     for col in CSV_COLUMNS:
         if col not in df.columns:
             df[col] = ""
-    df = df[CSV_COLUMNS].sort_values("skor_akhir", ascending=False)
+    df = df[CSV_COLUMNS].sort_values("Final_Score", ascending=False)
     df.to_csv(path, index=False)
-    print(f"[OK] {len(df)} saham disimpan ke {path} (urut skor tertinggi).")
+    print(f"[OK] {len(df)} saham -> {path} (urut Final_Score tertinggi).")
 
 
-_BANDAR_ICON = {"AKUMULASI": "🟢", "DISTRIBUSI": "🔴", "NETRAL": "⚪"}
-
-
-def build_message(picks: list, total: int, lolos: int, now: datetime) -> str:
-    header = f"📊 IDX TOP PICKS — {now:%d-%m-%Y %H:%M}"
-    footer = (f"⚠️ Skor = Bandar45 Teknikal30 Macro25\n"
-              f"💡 {lolos} dari {total} saham lolos ambang")
+def build_message(picks: list, n_qualified: int, n_liquid: int,
+                  macro: dict, now: datetime) -> str:
+    header = f"📊 IDX SCREENING — {now:%d-%m-%Y %H:%M}"
+    macro_line = macro_context_line(macro)
+    footer = (
+        "* Foreign Flow = PROXY OHLCV, verifikasi RTI sebelum entry\n"
+        f"📈 {n_qualified} saham lolos ambang dari {n_liquid} likuid\n"
+        "⚠️ Sistem fokus swing 1-10 hari, bukan investasi jangka panjang"
+    )
 
     if not picks:
-        return (f"{header}\n\nTIDAK ADA SETUP BERKUALITAS HARI INI\n\n{footer}")
+        return (f"{header}\n{macro_line}\n\n"
+                "🔴 TIDAK ADA SETUP BERKUALITAS HARI INI — CASH IS POSITION\n\n"
+                f"{footer}")
 
-    lines = [header, ""]
+    lines = [header, macro_line, ""]
     for i, s in enumerate(picks, 1):
-        icon = _BANDAR_ICON.get(s["bandar_status"], "⚪")
-        lines.append(f"{i}. {s['ticker']} | Skor: {s['skor_akhir']:.0f}/100")
-        lines.append(f"   🏦 Bandar: {icon}{s['bandar_status']}{s['bandar_arah']} "
-                     f"| 📈 Teknikal: {s['skor_teknikal']:.0f}")
-        lines.append(f"   Entry: {fmt(s['entry'])} | SL: {fmt(s['sl'])} (-3%) "
-                     f"| TP: {fmt(s['tp'])}")
+        lines.append(f"{i}. {s['Ticker']} | Score: {s['Final_Score']:.0f}/100 {s['Bintang']}".rstrip())
+        lines.append(f"   🎯 Fase: {s['Fase_Wyckoff']}")
+        lines.append(f"   🏦 Akum: {s['Skor_Akumulasi']:.0f} | "
+                     f"💎 SM: {s['Skor_SmartMoney']:.0f} | "
+                     f"🌍 Foreign*: {s['Skor_ForeignFlow_PROXY']:.0f}")
+        lines.append(f"   📊 Vol: {s['Skor_Volume']:.0f} | "
+                     f"🚀 Mom: {s['Skor_Momentum']:.0f} | "
+                     f"⚠️ Risk: {s['RisikoDistribusi']:.0f}")
+        lines.append(f"   💰 Entry: {fmt(s['Entry'])} | SL: -3% ({fmt(s['SL_3pct'])}) "
+                     f"| TP: {fmt(s['TP_resistance'])}")
+        kalimat = s["Alasan"].split(". ")[0]
+        lines.append(f"   💡 {kalimat}")
         lines.append("")
     lines.append(footer)
     return "\n".join(lines)
@@ -600,22 +982,29 @@ def send_telegram(text: str) -> bool:
 
 
 # ===========================================================================
-# PIPELINE INTI (dipakai run & selftest)
+# PIPELINE INTI
 # ===========================================================================
 
-def screen(data_map: dict, sektor_map: dict, macro: dict, now: datetime) -> list:
-    rows = []
+def screen(data_map: dict, sektor_map: dict, ihsg_close, now: datetime) -> tuple:
+    """Return (rows_lolos_filter, n_skip_likuiditas)."""
+    rows, skipped = [], 0
     for code, df in data_map.items():
+        close = df["Close"].astype(float)
+        volume = df["Volume"].astype(float)
+        value_20d = value_20d_rp(close, volume)
+        if value_20d < MIN_VALUE_20D:                    # hard filter likuiditas
+            skipped += 1
+            continue
         sektor = sektor_map.get(code, "LAINNYA")
         try:
-            res = score_stock(df, sektor, macro)
+            res = score_stock(df, sektor, ihsg_close, value_20d)
         except Exception as exc:                         # noqa: BLE001
             print(f"  {code}: gagal skoring ({exc})")
             continue
-        res.update({"ticker": code, "tanggal": f"{now:%Y-%m-%d}", "jam": f"{now:%H:%M}"})
+        res.update({"Ticker": code, "Tanggal": f"{now:%Y-%m-%d}", "Jam": f"{now:%H:%M}"})
         rows.append(res)
-    rows.sort(key=lambda r: r["skor_akhir"], reverse=True)
-    return rows
+    rows.sort(key=lambda r: r["Final_Score"], reverse=True)
+    return rows, skipped
 
 
 # ===========================================================================
@@ -628,53 +1017,73 @@ def run(send=True):
     sektor_map = load_sektor()
     macro = load_macro()
     total = len(codes)
-    print(f"Screening {total} saham IDX — {now:%Y-%m-%d %H:%M}")
-    print(f"Bobot: Bandar {W_BANDAR} | Teknikal {W_TEKNIKAL} | "
-          f"MacroID {W_MACRO_ID} | Global {W_GLOBAL}\n")
+    print(f"Screening Wyckoff/SMC {total} saham IDX — {now:%Y-%m-%d %H:%M}")
+    print("Catatan: skor Akumulasi/SmartMoney/ForeignFlow = PROXY dari OHLCV.\n")
 
+    ihsg_close = fetch_ihsg()
     data_map, gagal = download_all(codes)
-    print(f"\nBerhasil unduh {len(data_map)}/{total} saham. Gagal: {len(gagal)}")
+    print(f"\nUnduh OK {len(data_map)}/{total}. Gagal: {len(gagal)}")
     if gagal:
         with open(GAGAL_FILE, "w", encoding="utf-8") as fh:
             fh.write("\n".join(gagal) + "\n")
-        print(f"[OK] {len(gagal)} ticker gagal dicatat ke {GAGAL_FILE}: {gagal}")
+        print(f"[OK] {len(gagal)} ticker gagal -> {GAGAL_FILE}: {gagal}")
 
-    rows = screen(data_map, sektor_map, macro, now)
+    rows, skipped = screen(data_map, sektor_map, ihsg_close, now)
+    n_liquid = len(rows)
+    print(f"Lolos filter likuiditas: {n_liquid} (skip {skipped} karena value20d < Rp3M)")
     save_csv(rows)
 
-    qualified = [r for r in rows if r["skor_akhir"] >= SCORE_THRESHOLD]
+    qualified = [r for r in rows if r["Final_Score"] >= SCORE_THRESHOLD]
     picks = qualified[:MAX_PICKS]
-    message = build_message(picks, total, len(qualified), now)
+    message = build_message(picks, len(qualified), n_liquid, macro, now)
 
-    print("\n" + "=" * 48)
+    print("\n" + "=" * 52)
     print(message)
-    print("=" * 48 + "\n")
+    print("=" * 52 + "\n")
     if send:
         send_telegram(message)
 
 
 # ===========================================================================
-# SELF-TEST OFFLINE (tanpa internet)
+# SELF-TEST OFFLINE
 # ===========================================================================
 
-def _synthetic(kind: str, n: int = 140) -> pd.DataFrame:
+def _synthetic(kind: str, n: int = 160) -> pd.DataFrame:
     rng = np.random.default_rng(abs(hash(kind)) % (2**32))
-    if kind == "strong_buy":
-        base = np.linspace(900, 1500, n)
-        vol = np.linspace(1e6, 3.5e6, n)
-    elif kind == "downtrend":
-        base = np.linspace(1500, 900, n)
-        vol = np.linspace(3e6, 1e6, n)
-    elif kind == "oversold":
-        base = np.concatenate([np.linspace(1500, 950, n - 12),
-                               np.linspace(950, 1010, 12)])
-        vol = np.concatenate([np.full(n - 12, 1e6), np.linspace(1.6e6, 3e6, 12)])
-    else:  # sideways
-        base = 1200 + 30 * np.sin(np.linspace(0, 8 * np.pi, n))
+    if kind == "akumulasi_matang":
+        # turun -> sideways tight panjang dgn volume naik bertahap + spring
+        down = np.linspace(1500, 1000, 60)
+        side = 1000 + rng.normal(0, 8, n - 60)
+        base = np.concatenate([down, side])
+        vol = np.concatenate([np.linspace(2e6, 1e6, 60),
+                              np.linspace(1e6, 2.2e6, n - 60)])
+    elif kind == "markup_awal":
+        side = 1000 + rng.normal(0, 8, n - 30)
+        up = np.linspace(1000, 1130, 30)
+        base = np.concatenate([side, up])
+        vol = np.concatenate([np.full(n - 30, 1.2e6), np.linspace(1.5e6, 3e6, 30)])
+    elif kind == "sudah_lari":
+        base = np.concatenate([np.full(n - 12, 1000.0), np.linspace(1000, 1400, 12)])
+        vol = np.concatenate([np.full(n - 12, 1e6), np.linspace(3e6, 6e6, 12)])
+    elif kind == "distribusi":
+        up = np.linspace(1000, 1500, n - 20)
+        top = 1500 - np.linspace(0, 120, 20) + rng.normal(0, 20, 20)
+        base = np.concatenate([up, top])
+        vol = np.concatenate([np.linspace(1e6, 2e6, n - 20), np.linspace(3e6, 4.5e6, 20)])
+    else:  # sepi/sideways
+        base = 1000 + rng.normal(0, 5, n)
         vol = np.full(n, 1.1e6)
-    close = base + rng.normal(0, 6, n)
-    high = close + rng.uniform(3, 10, n)
-    low = close - rng.uniform(3, 10, n)
+    vol = vol * 5                                        # naikkan agar lolos filter likuiditas
+    close = base + rng.normal(0, 4, n)
+    high = close + rng.uniform(3, 9, n)
+    low = close - rng.uniform(3, 9, n)
+    # spring untuk akumulasi_matang: satu hari low-tajam, close rebound
+    if kind == "akumulasi_matang":
+        low[-7] = low[-7] - 40
+        close[-7] = (high[-7] + low[-7]) / 2 + 15
+    # distribusi: tambah upper-wick tajam di fase puncak
+    if kind == "distribusi":
+        high[-15:] = high[-15:] + rng.uniform(20, 45, 15)
     idx = pd.date_range("2024-01-01", periods=n, freq="D")
     return pd.DataFrame({"Open": close, "High": high, "Low": low,
                          "Close": close, "Volume": vol}, index=idx)
@@ -682,33 +1091,51 @@ def _synthetic(kind: str, n: int = 140) -> pd.DataFrame:
 
 def selftest():
     print("== SELF-TEST (offline, data sintetis) ==\n")
-    macro = {"IHSG_BIAS": "bullish", "SEKTOR_BANK": "bullish",
-             "SEKTOR_TAMBANG": "bearish", "KOMODITAS": "bullish",
-             "USD_IDR": "bearish", "RISK_SENTIMENT": "risk_on"}
-    sektor_map = {"AAA": "BANK", "BBB": "TAMBANG", "CCC": "KONSUMER",
-                  "DDD": "TEKNOLOGI"}
-    data_map = {"AAA": _synthetic("strong_buy"), "BBB": _synthetic("downtrend"),
-                "CCC": _synthetic("oversold"), "DDD": _synthetic("sideways")}
+    kinds = ["akumulasi_matang", "markup_awal", "sudah_lari", "distribusi", "sepi"]
+    sektor_map = {k.upper(): "TEKNOLOGI" for k in kinds}
+    data_map = {k.upper(): _synthetic(k) for k in kinds}
+    ihsg = pd.Series(np.linspace(7000, 7200, 80))
     now = datetime(2026, 6, 10, 15, 30)
 
-    rows = screen(data_map, sektor_map, macro, now)
-    print(f"{'TICK':<5}{'SEKTOR':<11}{'AKHIR':>7}{'BDR':>6}{'TEK':>6}"
-          f"{'MID':>6}{'GLB':>6}  STATUS")
+    rows, skipped = screen(data_map, sektor_map, ihsg, now)
+    print(f"{'TICKER':<18}{'FINAL':>6}{'AKUM':>6}{'SM':>5}{'FF':>5}"
+          f"{'VOL':>5}{'MOM':>5}{'RISK':>6}  FASE")
     for r in rows:
-        print(f"{r['ticker']:<5}{r['sektor']:<11}{r['skor_akhir']:>7.1f}"
-              f"{r['skor_bandar']:>6.1f}{r['skor_teknikal']:>6.1f}"
-              f"{r['skor_macro_id']:>6.1f}{r['skor_global']:>6.1f}  "
-              f"{r['bandar_status']}{r['bandar_arah']}")
-    print("\nContoh alasan (saham teratas):")
-    print(" ", rows[0]["alasan"])
+        print(f"{r['Ticker']:<18}{r['Final_Score']:>6.1f}{r['Skor_Akumulasi']:>6.0f}"
+              f"{r['Skor_SmartMoney']:>5.0f}{r['Skor_ForeignFlow_PROXY']:>5.0f}"
+              f"{r['Skor_Volume']:>5.0f}{r['Skor_Momentum']:>5.0f}"
+              f"{r['RisikoDistribusi']:>6.0f}  {r['Fase_Wyckoff']}")
+    print(f"\n(skip likuiditas: {skipped})")
+
+    # Uji langsung klasifikasi fase & skor dengan kombinasi skor ideal
+    print("\n-- uji klasifikasi (input skor langsung) --")
+    cases = [
+        # akum, vol, mom, risiko, rsi, range_contract, lower_highs, above20
+        ("Akumulasi Matang", 78, 55, 35, 20, 65, True, False, False),
+        ("Markup Awal",      70, 60, 60, 20, 60, True, False, True),
+        ("Markup Kuat",      60, 70, 78, 15, 68, False, False, True),
+        ("Akumulasi Awal",   60, 30, 35, 20, 50, False, False, False),
+        ("Distribusi Awal",  40, 60, 50, 55, 72, False, False, True),
+        ("Distribusi Matang",30, 60, 40, 75, 60, False, True, True),
+    ]
+    for expect, a_, v_, m_, r_, rsi_, rc_, lh_, ab_ in cases:
+        got = classify_phase(a_, v_, m_, r_, rsi_, rc_, lh_, ab_)
+        flag = "OK " if got == expect else "XX "
+        print(f"  {flag}harap={expect:<18} dapat={got}")
+    for sc in (95, 85, 75, 65, 50):
+        lab, star = classify_score(sc)
+        print(f"  score {sc} -> {star} {lab}")
+
+    print("\nContoh Alasan (saham teratas):")
+    print(" ", rows[0]["Alasan"])
 
     save_csv(rows, path="/tmp/ranking_selftest.csv")
 
-    print("\n-- contoh pesan (ambang diturunkan ke 0 utk demo) --")
-    picks = rows[:MAX_PICKS]
-    print(build_message(picks, total=100, lolos=len(picks), now=now))
-    print("\n-- contoh pesan tidak ada setup --")
-    print(build_message([], total=100, lolos=0, now=now))
+    print("\n-- contoh Telegram (ambang diturunkan utk demo) --")
+    print(build_message(rows[:MAX_PICKS], len(rows), len(rows),
+                        {"IHSG_BIAS": "netral", "USD_IDR": "bearish"}, now))
+    print("\n-- contoh tidak ada setup --")
+    print(build_message([], 0, len(rows), {}, now))
     print("\n[OK] self-test selesai.")
 
 
