@@ -1,0 +1,8 @@
+backtesting==0.6.5
+ccxt==4.5.57
+numpy==2.4.6
+pandas==3.0.3
+pyarrow==24.0.0
+python-dotenv==1.2.2
+quantstats==0.0.81
+requests==2.34.2
