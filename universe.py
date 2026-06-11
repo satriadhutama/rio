@@ -132,12 +132,17 @@ def get_candidate_pool(pool_size: int = 1000) -> pd.DataFrame:
 # Langkah 2: riwayat market cap per coin (dengan cache)
 # ---------------------------------------------------------------------------
 
-def fetch_market_cap_history(coin_id: str, days: int = 365) -> pd.Series | None:
-    """Ambil riwayat market cap harian satu coin. Hasil disimpan ke cache;
-    panggilan berikutnya membaca dari file, bukan dari API."""
+def fetch_market_history(coin_id: str, days: int = 365) -> pd.DataFrame | None:
+    """Ambil riwayat harian satu coin: harga, market cap, dan volume
+    (ketiganya datang dalam SATU panggilan API yang sama). Hasil disimpan
+    ke cache; panggilan berikutnya membaca dari file, bukan dari API."""
     cache_file = CACHE_DIR / f"{coin_id}.parquet"
     if cache_file.exists():
-        return pd.read_parquet(cache_file)["market_cap"]
+        cached = pd.read_parquet(cache_file)
+        if "price" in cached.columns:
+            return cached
+        # Format cache lama (hanya market_cap) -> unduh ulang yang lengkap.
+        cache_file.unlink()
 
     now = int(datetime.now(timezone.utc).timestamp())
     data = _get(f"/coins/{coin_id}/market_chart/range", {
@@ -145,19 +150,22 @@ def fetch_market_cap_history(coin_id: str, days: int = 365) -> pd.Series | None:
         "from": now - days * 86400,
         "to": now,
     })
-    caps = data.get("market_caps") or []
-    if not caps:
+    if not data.get("prices"):
         return None
 
-    df = pd.DataFrame(caps, columns=["ts_ms", "market_cap"])
-    df["date"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True).dt.normalize()
-    # Ambil nilai terakhir per hari (rentang >90 hari memang harian, tapi
-    # titik terakhir bisa berupa data terkini).
-    series = df.groupby("date")["market_cap"].last()
+    parts = {}
+    for key, col in [("prices", "price"), ("market_caps", "market_cap"),
+                     ("total_volumes", "volume")]:
+        raw = pd.DataFrame(data.get(key) or [], columns=["ts_ms", col])
+        raw["date"] = pd.to_datetime(raw["ts_ms"], unit="ms", utc=True).dt.normalize()
+        # Ambil nilai terakhir per hari (rentang >90 hari memang harian,
+        # tapi titik terakhir bisa berupa data terkini).
+        parts[col] = raw.groupby("date")[col].last()
+    df = pd.concat(parts.values(), axis=1)
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    series.to_frame().to_parquet(cache_file)
-    return series
+    df.to_parquet(cache_file)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -179,9 +187,9 @@ def build_universe(dates: list[pd.Timestamp], top_n: int = 300,
     for i, coin_id in enumerate(pool["id"], start=1):
         if i % 50 == 0 or i == len(pool):
             print(f"  riwayat {i}/{len(pool)} coin...")
-        series = fetch_market_cap_history(coin_id, days=history_days)
-        if series is not None and len(series) > 0:
-            histories[coin_id] = series
+        hist = fetch_market_history(coin_id, days=history_days)
+        if hist is not None and hist["market_cap"].notna().any():
+            histories[coin_id] = hist["market_cap"]
 
     meta = pool.set_index("id")[["symbol", "name"]]
     results = []
