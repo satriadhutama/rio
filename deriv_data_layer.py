@@ -170,23 +170,33 @@ def fetch_ohlcv_full(exchange: ccxt.bybit, symbol: str, key: str) -> pd.DataFram
 # --------------------------------------------------------------------------- #
 
 def fetch_funding_full(exchange: ccxt.bybit, symbol: str, key: str) -> pd.DataFrame:
-    """Pagination MAJU funding rate (Bybit funding tiap 8 jam) sampai habis,
-    lalu resample ke harian (sum 3 funding + mean)."""
-    records: list[dict] = []
-    cursor = START_DATE_MS
-    now_ms = exchange.milliseconds()
+    """Pagination MUNDUR funding rate (Bybit funding tiap 8 jam) sampai habis,
+    lalu resample ke harian (sum 3 funding + mean).
 
-    while cursor < now_ms:
-        batch = with_retry(exchange.fetch_funding_rate_history, symbol, cursor, 200)
+    Catatan: Bybit fetch_funding_rate_history tidak melayani `since` jauh ke
+    belakang (mis. 2020) -> endpoint membalas window MUNDUR dari titik acuan.
+    Karena itu kita mulai dari sekarang (since=None) dan geser mundur via
+    params={'until': <timestamp>}, mirip pola fetch_oi_full.
+    """
+    records: list[dict] = []
+    until = None  # None = ambil batch paling baru lebih dulu
+    seen_oldest = None
+
+    while True:
+        params = {} if until is None else {'until': until}
+        batch = with_retry(exchange.fetch_funding_rate_history,
+                           symbol, None, 200, params)
         time.sleep(RATE_SLEEP)
         if not batch:
             break
         records.extend(batch)
-        last_ts = batch[-1]['timestamp']
-        next_cursor = last_ts + 1
-        if next_cursor <= cursor:        # pengaman anti-loop
+        oldest_ts = min(r['timestamp'] for r in batch)
+        if seen_oldest is not None and oldest_ts >= seen_oldest:
+            break  # tidak maju mundur lagi -> stop
+        seen_oldest = oldest_ts
+        if oldest_ts <= START_DATE_MS:
             break
-        cursor = next_cursor
+        until = oldest_ts - 1
         if len(batch) < 200:             # batch terakhir
             break
 
