@@ -8,6 +8,7 @@ close, volume (urut waktu menaik).
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 from ta.trend import ADXIndicator, EMAIndicator, MACD
 from ta.volatility import AverageTrueRange
@@ -26,26 +27,44 @@ def add_ema(df: pd.DataFrame, periods: tuple[int, ...] = (50, 200)) -> pd.DataFr
 
 
 def add_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
-    """Tambahkan kolom ATR (Average True Range) bernama `atr_<period>`."""
+    """Tambahkan kolom ATR (Average True Range) bernama `atr_<period>`.
+
+    Catatan: library `ta` mengabaikan `fillna=False` dan tetap mengisi
+    periode warm-up dengan 0.0. Kita override `period` baris pertama
+    menjadi NaN agar sesuai semantik matematis (ATR butuh `period` bar
+    untuk smoothing pertama).
+    """
     out = df.copy()
     atr = AverageTrueRange(
         high=out["high"], low=out["low"], close=out["close"],
         window=period, fillna=False,
     )
-    out.loc[:, f"atr_{period}"] = atr.average_true_range()
+    col = f"atr_{period}"
+    out.loc[:, col] = atr.average_true_range()
+    out.iloc[:period, out.columns.get_loc(col)] = np.nan
     return out
 
 
 def add_adx(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
-    """Tambahkan kolom ADX dan komponennya: `adx_<p>`, `di_plus_<p>`, `di_minus_<p>`."""
+    """Tambahkan kolom ADX dan komponennya: `adx_<p>`, `di_plus_<p>`, `di_minus_<p>`.
+
+    Catatan: library `ta` mengabaikan `fillna=False` dan tetap mengisi
+    periode warm-up dengan 0.0. ADX butuh dua fase smoothing (DI lalu
+    ADX itu sendiri), jadi `2 * period` baris pertama kita override
+    menjadi NaN.
+    """
     out = df.copy()
     adx = ADXIndicator(
         high=out["high"], low=out["low"], close=out["close"],
         window=period, fillna=False,
     )
-    out.loc[:, f"adx_{period}"] = adx.adx()
-    out.loc[:, f"di_plus_{period}"] = adx.adx_pos()
-    out.loc[:, f"di_minus_{period}"] = adx.adx_neg()
+    cols = (f"adx_{period}", f"di_plus_{period}", f"di_minus_{period}")
+    out.loc[:, cols[0]] = adx.adx()
+    out.loc[:, cols[1]] = adx.adx_pos()
+    out.loc[:, cols[2]] = adx.adx_neg()
+    warmup = 2 * period
+    for c in cols:
+        out.iloc[:warmup, out.columns.get_loc(c)] = np.nan
     return out
 
 
