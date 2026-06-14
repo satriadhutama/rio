@@ -1,104 +1,108 @@
-# Quant Edge Engine — Crypto Trade Journal
+# crypto-backtest
 
-Sistem pencatatan trade crypto berbasis Python + Excel (`.xlsx`).  
-Satu file Excel, tiga sheet: **Log** (data trade), **Evaluasi** (metrik otomatis), **Equity** (kurva R + chart).
+Backtest dan demo trading strategi trend-following daily untuk Bybit
+perpetual. Pipeline-nya satu arah: data derivatif (OHLCV + funding rate
++ open interest) → indikator teknikal → sinyal entry → simulator
+bar-per-bar dengan funding accounting → metrik kinerja → orchestrator
+multi-coin.
 
----
+## Strategi final: v2 (funding + OI filter)
 
-## Install
+Strategi produksi adalah `strategy_trend_v2.compute_signals_v2`, yaitu
+strategi v1 (ADX + EMA bias + MACD cross) ditambah dua filter regime
+berbasis data derivatif:
+
+- **Funding rate ekstrem** memblok entry yang melawan kerumunan
+  (long diblok saat funding 8h sangat positif; short diblok saat
+  funding sangat negatif).
+- **Open Interest growth** memblok entry saat OI ≤ rata-rata rolling
+  (momentum tanpa partisipasi baru).
+
+V1 (`strategy_trend.py`) dipertahankan sebagai baseline pembanding.
+Eksperimen v3 (filter volatility) sudah dievaluasi dan didrop —
+filter v3 menggugurkan terlalu banyak sinyal tanpa memperbaiki
+risk-adjusted return secara meyakinkan.
+
+## Universe
+
+5 coin Bybit perpetual:
+
+- BNB
+- XRP
+- ADA
+- DOGE
+- TRX
+
+## Parameter strategi v2 (default)
+
+| Parameter | Nilai | Catatan |
+|---|---|---|
+| `adx_threshold` | 20.0 | Regime: ADX > 20 = ada tren |
+| `atr_sl_mult` | 2.0 | SL = entry ± 2 × ATR(14) |
+| `atr_tp_mult` | 3.0 | TP = entry ± 3 × ATR(14) (R:R 1:1.5) |
+| `funding_long_block` | 0.0003 | p90 historis funding 8h |
+| `funding_short_block` | -0.00025 | p10 historis funding 8h |
+| `oi_growth_min` | 0.0 | OI hari ini harus > rata-rata |
+| `oi_growth_window` | 7 | Jendela rolling OI growth (hari) |
+
+## Parameter backtest engine (default)
+
+| Parameter | Nilai |
+|---|---|
+| `initial_capital` | USD 10.000 per coin (modal terpisah) |
+| `risk_per_trade` | 3% ekuitas per trade |
+| `leverage` | 10× notional |
+| `fee_taker` | 0.055% per sisi |
+| `slippage` | 0.05% adverse per sisi |
+| `tie_break` | `SL` (worst-case saat SL & TP tersentuh di bar yang sama) |
+
+## Cara update data
 
 ```bash
-pip install openpyxl
+python deriv_data_layer.py --full
 ```
 
----
+Mengunduh OHLCV harian, funding rate 8 jam, dan open interest harian
+untuk semua coin universe, lalu menyimpannya ke
+`data/deriv/{ohlcv,funding,oi}/{COIN}.parquet`. Mode inkremental: hanya
+hari baru yang diunduh.
 
-## Cara Jalankan
-
-### Mode A — Interaktif (menu di terminal)
+## Cara generate sinyal harian
 
 ```bash
-python journal.py
+python daily_signal.py
 ```
 
-Menu:
-1. Catat call baru
-2. Update hasil trade
-3. Recompute evaluasi
-4. Lihat ringkasan
-0. Keluar
+Membaca data terbaru, menjalankan pipeline v2, dan mencetak sinyal
+entry untuk eksekusi hari ini (long/short/no-trade per coin dengan
+SL/TP yang dihitung). _Catatan: file ini akan dibuat di iterasi
+berikutnya._
 
----
+## Modul
 
-### Mode B — Satu-Baris Cepat
+| File | Fungsi |
+|---|---|
+| `deriv_data_layer.py` | Downloader OHLCV + funding + OI dari Bybit (inkremental) |
+| `indicators.py` | EMA, ATR, ADX, MACD via library `ta` |
+| `strategy_trend.py` | Sinyal v1 (baseline) |
+| `strategy_trend_v2.py` | Sinyal v2 (produksi) — v1 + funding/OI filter |
+| `backtest_engine.py` | Simulator bar-per-bar dengan funding accounting |
+| `metrics.py` | Statistik trade + rasio risiko/imbal hasil |
+| `run_multi_coin.py` | Orchestrator backtest v1 di 5 coin |
+| `run_multi_coin_v2.py` | Orchestrator backtest v2 di 5 coin |
 
-#### Catat call baru
+## Status
+
+- ✅ Backtest v1 & v2 selesai (data 2018–sekarang untuk coin yang ada).
+- ✅ Strategi produksi terkunci di v2.
+- 🟡 Sedang masuk fase **demo trading** (paper trade) sebelum live.
+- ⬜ Live trading: pending dukungan eksekusi otomatis.
+
+## Setup environment
+
 ```bash
-python journal.py add "COIN,Setup,Bias,Score,Confidence,Verdict,Entry,SL,TP1,TP2,TP3,RR,P1,P2,P3,P4,P5,P6"
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env       # isi kredensial API kalau perlu
 ```
-
-**Contoh:**
-```bash
-python journal.py add "SUI,Narrative,long,78,High,EKSEKUSI,3.85,3.77,4.0,4.2,4.5,1:3.5,1,1,1,1,1,0"
-python journal.py add "BTC,Divergence,short,65,Med,WAIT,42000,42500,41000,,,1:2,1,0,-1,1,0,1"
-```
-
-- No & Tanggal otomatis
-- Hasil default = `Pending`
-- Field opsional di belakang (TP2, TP3, RR, P-) boleh dikosongkan
-
-#### Update hasil trade
-```bash
-python journal.py result <No> "Hasil,R_aktual,Exit,catatan"
-```
-
-**Contoh:**
-```bash
-python journal.py result 1 "Win,3.0,4.5,TP3 kena bersih"
-python journal.py result 2 "Loss,-1.0,42450,SL kena, invalidasi volume"
-python journal.py result 3 "BE,0,41200,exit manual sebelum TP"
-```
-
-#### Lihat ringkasan statistik
-```bash
-python journal.py stats
-```
-
-#### Recompute manual (jika perlu)
-```bash
-python journal.py recompute
-```
-
----
-
-## Nilai yang Valid
-
-| Field       | Nilai yang Diterima                              |
-|-------------|--------------------------------------------------|
-| Setup       | `Narrative`, `Divergence`, `SM pre-pump`, `Lain` |
-| Bias        | `long`, `short`                                  |
-| Confidence  | `Low`, `Med`, `High`                             |
-| Verdict     | `EKSEKUSI`, `WAIT`, `ABAIKAN`                    |
-| Hasil       | `Win`, `Loss`, `BE`, `Skip`, `Pending`           |
-| P1–P6       | `-1`, `0`, `1`                                   |
-
----
-
-## File Output
-
-`quant_edge_journal.xlsx` — dibuat otomatis jika belum ada.
-
-| Sheet    | Isi                                                         |
-|----------|-------------------------------------------------------------|
-| Log      | Semua trade, 1 baris per trade                              |
-| Evaluasi | Metrik otomatis: expectancy, WR, per pilar/setup/verdict    |
-| Equity   | Kurva R kumulatif + line chart                              |
-
----
-
-## Catatan Metrik
-
-- **Expectancy** = `(WinRate × AvgWin) − (LossRate × AvgLoss)`  
-- Trade `Pending` dan `Skip` **tidak** dihitung di metrik
-- Pilar dengan `n < 10` diberi tanda *(sampel kecil, belum reliabel)*
-- Warna hijau = positif/prediktif, merah = negatif/lemah, kuning = sampel kecil
