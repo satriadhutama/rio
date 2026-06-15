@@ -18,7 +18,7 @@ ARSITEKTUR SKOR (semua 0-100 sebelum dibobot)
 
   Final = Akumulasi*0.40 + SmartMoney*0.25 + ForeignFlow*0.15
         + Volume*0.10    + Momentum*0.10   - RisikoDistribusi*0.20
-  (di-clamp ke 0-100 setelah penalti)
+  (di-clamp ke 0-100, lalu bonus/penalti tambahan di bawah, clamp lagi)
 
   1. Akumulasi (40%)        : ADL/OBV slope, range contraction, CLV, MFI, spring
   2. Smart Money (25%, proxy): volume climax, effort-vs-result, strong close, dst
@@ -26,6 +26,12 @@ ARSITEKTUR SKOR (semua 0-100 sebelum dibobot)
   4. Volume (10%)           : rasio vs avg5/avg20, tren, bonus likuiditas besar
   5. Momentum (10%)         : RSI/MACD/EMA, dengan penalti telat/overbought
   6. Risiko Distribusi (penalti 20%): upper-wick, lower-highs, divergensi ADL/MFI
+
+  BONUS/PENALTI TAMBAHAN (langsung ke Final Score, setelah bobot di atas):
+    + Markup Kuat & RSI 50-65 & shakeout 5d terakhir & CLV10d>0.3 -> +10
+    + Markup Awal & volume expansion (>1.3x avg20)                -> +5
+    - Sudah naik >20% dlm 10 hari (overheat)                      -> -10
+    - RSI >75 (overbought)                                        -> -5
 
   macro.txt TIDAK masuk Final Score -> hanya konteks di header Telegram.
 
@@ -35,9 +41,9 @@ FASE WYCKOFF (tag per saham, lihat classify_phase())
   Distribusi Awal / Distribusi Matang / Netral
 
 KLASIFIKASI FINAL SCORE
-  >=90 ⭐⭐⭐ SANGAT SIAP MARKUP   80-89 ⭐⭐ SIAP MARKUP
-  70-79 ⭐ WATCHLIST PRIORITAS    60-69 ⚠️ PERLU KONFIRMASI
-  <60  HINDARI (tidak dikirim Telegram)
+  >=75 ⭐⭐⭐ SANGAT SIAP MARKUP   60-74 ⭐⭐ SIAP MARKUP
+  45-59 ⭐ WATCHLIST PRIORITAS    35-44 ⚠️ PERLU KONFIRMASI
+  <35  HINDARI (tidak dikirim Telegram)
 
 ================================================================
 FILTER LIKUIDITAS (hard filter, sebelum skoring)
@@ -53,7 +59,7 @@ FILE PENDUKUNG (edit manual, tanpa coding):
 OUTPUT:
   ranking_lengkap.csv : semua saham (lolos filter) + skor tiap layer + alasan
   gagal.txt           : ticker gagal diunduh
-  Telegram            : top 5 dengan Final Score >= 60
+  Telegram            : top 5 dengan Final Score >= 45
 
 CARA JALANKAN:
   pip install yfinance pandas numpy requests
@@ -93,7 +99,7 @@ IHSG_TICKER = "^JKSE"
 W_AKUMULASI, W_SMARTMONEY, W_FOREIGN = 0.40, 0.25, 0.15
 W_VOLUME, W_MOMENTUM, W_RISIKO = 0.10, 0.10, 0.20
 
-SCORE_THRESHOLD = 60                    # ambang minimal masuk Telegram
+SCORE_THRESHOLD = 45                    # ambang minimal masuk Telegram
 MAX_PICKS = 5
 
 # Filter likuiditas
@@ -321,6 +327,11 @@ def score_akumulasi(ind: dict) -> dict:
         score += 3
         notes.append(f"{shakeout_count} hari shakeout (low baru, close rebound)")
 
+    # shakeout dalam 5 hari terakhir (rolling-20 min) -> dipakai utk bonus Markup Kuat
+    rolling_min20 = ind["low"].rolling(20).min().shift(1)
+    shakeout_mask = (ind["low"] < rolling_min20) & (close > open_proxy)
+    shakeout_5d = bool(shakeout_mask.tail(5).any())
+
     mfi_bull_div = False
     if len(close) > 16:
         win_close, win_mfi = close.tail(15), mfi_s.tail(15)
@@ -344,6 +355,8 @@ def score_akumulasi(ind: dict) -> dict:
         "_range_contraction": range_contraction,
         "_sideways_rising_vol": sideways_rising_vol,
         "_shakeout_count": shakeout_count,
+        "_shakeout_5d": shakeout_5d,
+        "_clv_avg10": clv_avg10,
         "_mfi_bull_div": mfi_bull_div,
         "_notes_akumulasi": notes,
     }
@@ -705,18 +718,18 @@ def classify_phase(akum, vol, mom, risiko, rsi_now, range_contraction,
 
 def classify_score(final: float) -> tuple:
     """Return (label, bintang) berdasarkan Final Score."""
-    if final >= 90:
+    if final >= 75:
         return "SANGAT SIAP MARKUP", "⭐⭐⭐"
-    if final >= 80:
-        return "SIAP MARKUP", "⭐⭐"
-    if final >= 70:
-        return "WATCHLIST PRIORITAS", "⭐"
     if final >= 60:
+        return "SIAP MARKUP", "⭐⭐"
+    if final >= 45:
+        return "WATCHLIST PRIORITAS", "⭐"
+    if final >= 35:
         return "PERLU KONFIRMASI", "⚠️"
     return "HINDARI", ""
 
 
-def build_alasan(phase, a, sm, ff, vol, mom, risiko) -> str:
+def build_alasan(phase, a, sm, ff, vol, mom, risiko, adj_notes=None) -> str:
     """Gabung catatan tiap layer jadi satu kalimat audit singkat."""
     bits = []
     if a["_notes_akumulasi"]:
@@ -730,6 +743,8 @@ def build_alasan(phase, a, sm, ff, vol, mom, risiko) -> str:
     foreign = "Foreign proxy " + ("bullish" if ff["skor_foreign_flow"] >= 55
                                   else "netral/lemah") + " (verifikasi RTI)"
     bits.append(foreign)
+    if adj_notes:
+        bits.append("; ".join(adj_notes))
     text = f"[{phase}] " + ". ".join(b for b in bits if b)
     return text[:300]
 
@@ -757,6 +772,30 @@ def score_stock(df: pd.DataFrame, sektor: str, ihsg_close, value_20d: float) -> 
                            mom["skor_momentum"], risiko["skor_risiko_distribusi"],
                            rsi_now, a["_range_contraction"],
                            risiko["_lower_highs"], mom["_above_ema20"])
+
+    # --- Bonus/penalti tambahan langsung ke Final Score (lihat docstring) ---
+    adj_notes = []
+    run10 = pct_change_n(ind["close"], 10)
+    volume_expansion = bool(ind["volume"].iloc[-1] > 1.3 * ind["avgvol20"].iloc[-1])
+
+    if (phase == "Markup Kuat" and 50 <= rsi_now <= 65
+            and a["_shakeout_5d"] and a["_clv_avg10"] > 0.3):
+        final += 10
+        adj_notes.append("+10 bonus: Markup Kuat + shakeout 5d + CLV10d>0.3, RSI masih sehat")
+
+    if phase == "Markup Awal" and volume_expansion:
+        final += 5
+        adj_notes.append("+5 bonus: Markup Awal + volume expansion (>1.3x avg20)")
+
+    if run10 > 0.20:
+        final -= 10
+        adj_notes.append(f"-10 penalti: harga sudah naik {run10*100:.0f}% dlm 10 hari (overheat)")
+
+    if rsi_now > 75:
+        final -= 5
+        adj_notes.append("-5 penalti: RSI>75 (overbought)")
+
+    final = clamp(final, 0, 100)
     label, bintang = classify_score(final)
 
     price = ind["price"]
@@ -764,10 +803,12 @@ def score_stock(df: pd.DataFrame, sektor: str, ihsg_close, value_20d: float) -> 
     sl = round(entry * 0.97, 2)
     tp = ind["resistance"] if ind["resistance"] > entry else round(entry * 1.05, 2)
     change_pct = round(pct_change_n(ind["close"], 1) * 100, 2)
-    alasan = build_alasan(phase, a, sm, ff, vol, mom, risiko)
+    change5d_pct = round(pct_change_n(ind["close"], 5) * 100, 2)
+    alasan = build_alasan(phase, a, sm, ff, vol, mom, risiko, adj_notes)
 
     return {
         "Sektor": sektor, "Harga": entry, "Change%": change_pct,
+        "Change5d%": change5d_pct, "RSI": round(rsi_now, 1),
         "Value_20d_Rp": round(value_20d),
         "Skor_Akumulasi": a["skor_akumulasi"],
         "Skor_SmartMoney": sm["skor_smart_money"],
@@ -908,7 +949,7 @@ def fmt(value: float) -> str:
 
 
 CSV_COLUMNS = [
-    "Tanggal", "Jam", "Ticker", "Sektor", "Harga", "Change%", "Value_20d_Rp",
+    "Tanggal", "Jam", "Ticker", "Sektor", "Harga", "Change%", "Change5d%", "RSI", "Value_20d_Rp",
     "Skor_Akumulasi", "Skor_SmartMoney", "Skor_ForeignFlow_PROXY",
     "Skor_Volume", "Skor_Momentum", "RisikoDistribusi",
     "Final_Score", "Klasifikasi", "Fase_Wyckoff",
@@ -946,12 +987,11 @@ def build_message(picks: list, n_qualified: int, n_liquid: int,
 
     lines = [header, macro_line, ""]
     for i, s in enumerate(picks, 1):
-        lines.append(f"{i}. {s['Ticker']} | Score: {s['Final_Score']:.0f}/100 {s['Bintang']}".rstrip())
-        lines.append(f"   🎯 Fase: {s['Fase_Wyckoff']}")
+        label_full = f"{s['Bintang']} {s['Klasifikasi']}".strip()
+        lines.append(f"{i}. {s['Ticker']} | Score: {s['Final_Score']:.0f}/100 {label_full}")
+        lines.append(f"   🎯 Fase: {s['Fase_Wyckoff']} | RSI: {s['RSI']:.0f} | "
+                     f"5d Move: {s['Change5d%']:+.1f}%")
         lines.append(f"   🏦 Akum: {s['Skor_Akumulasi']:.0f} | "
-                     f"💎 SM: {s['Skor_SmartMoney']:.0f} | "
-                     f"🌍 Foreign*: {s['Skor_ForeignFlow_PROXY']:.0f}")
-        lines.append(f"   📊 Vol: {s['Skor_Volume']:.0f} | "
                      f"🚀 Mom: {s['Skor_Momentum']:.0f} | "
                      f"⚠️ Risk: {s['RisikoDistribusi']:.0f}")
         lines.append(f"   💰 Entry: {fmt(s['Entry'])} | SL: -3% ({fmt(s['SL_3pct'])}) "
