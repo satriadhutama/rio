@@ -28,10 +28,13 @@ ARSITEKTUR SKOR (semua 0-100 sebelum dibobot)
   6. Risiko Distribusi (penalti 20%): upper-wick, lower-highs, divergensi ADL/MFI
 
   BONUS/PENALTI TAMBAHAN (langsung ke Final Score, setelah bobot di atas):
-    + Markup Kuat & RSI 50-65 & shakeout 5d terakhir & CLV10d>0.3 -> +10
-    + Markup Awal & volume expansion (>1.3x avg20)                -> +5
-    - Sudah naik >20% dlm 10 hari (overheat)                      -> -10
-    - RSI >75 (overbought)                                        -> -5
+    + Fase Markup (Awal/Kuat) & RSI 45-65 & CLV10d>0.3 & volume naik
+      5 hari berturut             -> +12 "Healthy markup with volume confirmation"
+    + Fase Markup (Awal/Kuat) & ada shakeout 5 hari terakhir
+                                   -> +8  "Shakeout absorbed, supply test passed"
+    - Sudah naik >20% dlm 10 hari (overheat)               -> -10
+    - RSI >78 (overbought ekstrem)                         -> -8
+    - Upper wick >60% range, 3 hari berturut-turut         -> -5
 
   macro.txt TIDAK masuk Final Score -> hanya konteks di header Telegram.
 
@@ -40,10 +43,11 @@ FASE WYCKOFF (tag per saham, lihat classify_phase())
   Akumulasi Awal / Akumulasi Matang / Markup Awal / Markup Kuat /
   Distribusi Awal / Distribusi Matang / Netral
 
-KLASIFIKASI FINAL SCORE
-  >=75 ⭐⭐⭐ SANGAT SIAP MARKUP   60-74 ⭐⭐ SIAP MARKUP
-  45-59 ⭐ WATCHLIST PRIORITAS    35-44 ⚠️ PERLU KONFIRMASI
-  <35  HINDARI (tidak dikirim Telegram)
+KLASIFIKASI FINAL SCORE (kalibrasi audit/backtest -- distribusi skor IDX
+realistis: skor maksimum sekitar 50, median sekitar 30)
+  >=55 ⭐⭐⭐ SANGAT SIAP MARKUP   45-54 ⭐⭐ SIAP MARKUP
+  35-44 ⭐ WATCHLIST PRIORITAS    25-34 ⚠️ PERLU KONFIRMASI
+  <25  HINDARI (tidak dikirim Telegram)
 
 ================================================================
 FILTER LIKUIDITAS (hard filter, sebelum skoring)
@@ -58,8 +62,11 @@ FILE PENDUKUNG (edit manual, tanpa coding):
 
 OUTPUT:
   ranking_lengkap.csv : semua saham (lolos filter) + skor tiap layer + alasan
+  backtest_data.csv   : semua saham lolos ambang (Final_Score >= 35), utk audit
+                        win-rate via update_backtest.py (return_5d/return_10d)
   gagal.txt           : ticker gagal diunduh
-  Telegram            : top 5 dengan Final Score >= 45
+  Telegram            : maksimal 7 saham dengan Final Score >= 35, dikelompokkan
+                        per label ⭐⭐⭐/⭐⭐/⭐
 
 CARA JALANKAN:
   pip install yfinance pandas numpy requests
@@ -68,6 +75,7 @@ CARA JALANKAN:
   python monitor_idx.py                 # full run + kirim Telegram
   python monitor_idx.py --no-telegram   # screening + CSV saja
   python monitor_idx.py --selftest      # uji logika offline (data sintetis)
+  python update_backtest.py             # isi return 5d/10d & laporan win-rate
 """
 
 import os
@@ -90,6 +98,7 @@ TOP100_FILE = "top100.txt"
 SEKTOR_FILE = "sektor.txt"
 MACRO_FILE = "macro.txt"
 RANKING_CSV = "ranking_lengkap.csv"
+BACKTEST_CSV = "backtest_data.csv"
 GAGAL_FILE = "gagal.txt"
 LOG_FILE = "trading_log.txt"
 
@@ -99,8 +108,8 @@ IHSG_TICKER = "^JKSE"
 W_AKUMULASI, W_SMARTMONEY, W_FOREIGN = 0.40, 0.25, 0.15
 W_VOLUME, W_MOMENTUM, W_RISIKO = 0.10, 0.10, 0.20
 
-SCORE_THRESHOLD = 45                    # ambang minimal masuk Telegram
-MAX_PICKS = 5
+SCORE_THRESHOLD = 35                    # ambang minimal masuk Telegram
+MAX_PICKS = 7
 
 # Filter likuiditas
 MIN_VALUE_20D = 3_000_000_000           # Rp 3 miliar -> hard filter
@@ -718,13 +727,13 @@ def classify_phase(akum, vol, mom, risiko, rsi_now, range_contraction,
 
 def classify_score(final: float) -> tuple:
     """Return (label, bintang) berdasarkan Final Score."""
-    if final >= 75:
+    if final >= 55:
         return "SANGAT SIAP MARKUP", "⭐⭐⭐"
-    if final >= 60:
-        return "SIAP MARKUP", "⭐⭐"
     if final >= 45:
-        return "WATCHLIST PRIORITAS", "⭐"
+        return "SIAP MARKUP", "⭐⭐"
     if final >= 35:
+        return "WATCHLIST PRIORITAS", "⭐"
+    if final >= 25:
         return "PERLU KONFIRMASI", "⚠️"
     return "HINDARI", ""
 
@@ -776,24 +785,31 @@ def score_stock(df: pd.DataFrame, sektor: str, ihsg_close, value_20d: float) -> 
     # --- Bonus/penalti tambahan langsung ke Final Score (lihat docstring) ---
     adj_notes = []
     run10 = pct_change_n(ind["close"], 10)
-    volume_expansion = bool(ind["volume"].iloc[-1] > 1.3 * ind["avgvol20"].iloc[-1])
+    clv_avg10 = a["_clv_avg10"]
+    vol_avg_recent5 = float(ind["volume"].tail(5).mean())
+    vol_avg_prior5 = float(ind["volume"].iloc[-10:-5].mean())
+    volume_naik_5d = vol_avg_recent5 > vol_avg_prior5
 
-    if (phase == "Markup Kuat" and 50 <= rsi_now <= 65
-            and a["_shakeout_5d"] and a["_clv_avg10"] > 0.3):
-        final += 10
-        adj_notes.append("+10 bonus: Markup Kuat + shakeout 5d + CLV10d>0.3, RSI masih sehat")
-
-    if phase == "Markup Awal" and volume_expansion:
-        final += 5
-        adj_notes.append("+5 bonus: Markup Awal + volume expansion (>1.3x avg20)")
+    if phase in ("Markup Awal", "Markup Kuat"):
+        if 45 <= rsi_now <= 65 and clv_avg10 > 0.3 and volume_naik_5d:
+            final += 12
+            adj_notes.append("+12 bonus: Healthy markup with volume confirmation")
+        if a["_shakeout_5d"]:
+            final += 8
+            adj_notes.append("+8 bonus: Shakeout absorbed, supply test passed")
 
     if run10 > 0.20:
         final -= 10
         adj_notes.append(f"-10 penalti: harga sudah naik {run10*100:.0f}% dlm 10 hari (overheat)")
 
-    if rsi_now > 75:
+    if rsi_now > 78:
+        final -= 8
+        adj_notes.append("-8 penalti: RSI>78 (overbought ekstrem)")
+
+    clv_last3 = ind["clv"].tail(3)
+    if len(clv_last3) == 3 and bool((clv_last3 < -0.2).all()):
         final -= 5
-        adj_notes.append("-5 penalti: RSI>75 (overbought)")
+        adj_notes.append("-5 penalti: upper wick >60% range 3 hari berturut (supply kuat di atas)")
 
     final = clamp(final, 0, 100)
     label, bintang = classify_score(final)
@@ -970,14 +986,59 @@ def save_csv(rows: list, path: str = RANKING_CSV):
     print(f"[OK] {len(df)} saham -> {path} (urut Final_Score tertinggi).")
 
 
-def build_message(picks: list, n_qualified: int, n_liquid: int,
-                  macro: dict, now: datetime) -> str:
+BACKTEST_COLUMNS = [
+    "tanggal_screening", "ticker", "final_score", "klasifikasi", "fase",
+    "entry_price", "sl_price", "tp_price", "alasan_full",
+    "skor_akumulasi", "skor_smartmoney", "skor_foreign",
+    "skor_volume", "skor_momentum", "risiko_distribusi",
+    "price_5d_later", "price_10d_later", "return_5d", "return_10d",
+]
+
+
+def append_backtest_csv(rows: list, now: datetime, path: str = BACKTEST_CSV):
+    """Tambah baris baru ke backtest_data.csv (semua saham lolos ambang)."""
+    if not rows:
+        return
+    new_rows = []
+    for r in rows:
+        new_rows.append({
+            "tanggal_screening": f"{now:%Y-%m-%d}",
+            "ticker": r["Ticker"],
+            "final_score": r["Final_Score"],
+            "klasifikasi": r["Klasifikasi"],
+            "fase": r["Fase_Wyckoff"],
+            "entry_price": r["Entry"],
+            "sl_price": r["SL_3pct"],
+            "tp_price": r["TP_resistance"],
+            "alasan_full": r["Alasan"],
+            "skor_akumulasi": r["Skor_Akumulasi"],
+            "skor_smartmoney": r["Skor_SmartMoney"],
+            "skor_foreign": r["Skor_ForeignFlow_PROXY"],
+            "skor_volume": r["Skor_Volume"],
+            "skor_momentum": r["Skor_Momentum"],
+            "risiko_distribusi": r["RisikoDistribusi"],
+            "price_5d_later": "",
+            "price_10d_later": "",
+            "return_5d": "",
+            "return_10d": "",
+        })
+    df_new = pd.DataFrame(new_rows, columns=BACKTEST_COLUMNS)
+    if os.path.exists(path):
+        df_new.to_csv(path, mode="a", header=False, index=False)
+    else:
+        df_new.to_csv(path, mode="w", header=True, index=False)
+    print(f"[OK] {len(df_new)} baris -> {path} (append, utk backtest).")
+
+
+def build_message(qualified: list, n_liquid: int, macro: dict, now: datetime) -> str:
     header = f"📊 IDX SCREENING — {now:%d-%m-%Y %H:%M}"
     macro_line = macro_context_line(macro)
+    picks = qualified[:MAX_PICKS]
+    n_qualified = len(qualified)
     footer = (
-        "* Foreign Flow = PROXY OHLCV, verifikasi RTI sebelum entry\n"
+        "* Foreign Flow = PROXY, verifikasi RTI\n"
         f"📈 {n_qualified} saham lolos ambang dari {n_liquid} likuid\n"
-        "⚠️ Sistem fokus swing 1-10 hari, bukan investasi jangka panjang"
+        "⚠️ Sistem audit mode: threshold longgar untuk backtest"
     )
 
     if not picks:
@@ -985,20 +1046,39 @@ def build_message(picks: list, n_qualified: int, n_liquid: int,
                 "🔴 TIDAK ADA SETUP BERKUALITAS HARI INI — CASH IS POSITION\n\n"
                 f"{footer}")
 
+    tier_titles = {"⭐⭐⭐": "HIGH CONVICTION", "⭐⭐": "GOOD SETUP", "⭐": "WATCHLIST"}
+    counts = {"⭐⭐⭐": 0, "⭐⭐": 0, "⭐": 0}
+    for s in qualified:
+        if s["Bintang"] in counts:
+            counts[s["Bintang"]] += 1
+
     lines = [header, macro_line, ""]
-    for i, s in enumerate(picks, 1):
-        label_full = f"{s['Bintang']} {s['Klasifikasi']}".strip()
-        lines.append(f"{i}. {s['Ticker']} | Score: {s['Final_Score']:.0f}/100 {label_full}")
-        lines.append(f"   🎯 Fase: {s['Fase_Wyckoff']} | RSI: {s['RSI']:.0f} | "
-                     f"5d Move: {s['Change5d%']:+.1f}%")
-        lines.append(f"   🏦 Akum: {s['Skor_Akumulasi']:.0f} | "
-                     f"🚀 Mom: {s['Skor_Momentum']:.0f} | "
-                     f"⚠️ Risk: {s['RisikoDistribusi']:.0f}")
-        lines.append(f"   💰 Entry: {fmt(s['Entry'])} | SL: -3% ({fmt(s['SL_3pct'])}) "
-                     f"| TP: {fmt(s['TP_resistance'])}")
-        kalimat = s["Alasan"].split(". ")[0]
-        lines.append(f"   💡 {kalimat}")
+    idx = 0
+    for bintang in ("⭐⭐⭐", "⭐⭐", "⭐"):
+        tier_picks = [s for s in picks if s["Bintang"] == bintang]
+        if not tier_picks:
+            continue
+        lines.append(f"{bintang} {tier_titles[bintang]}:")
+        for s in tier_picks:
+            idx += 1
+            kalimat = s["Alasan"].split(". ")[0]
+            if bintang == "⭐":
+                lines.append(f"{idx}. {s['Ticker']} | {s['Final_Score']:.0f}/100 — {kalimat}")
+            else:
+                vol20_m = s["Value_20d_Rp"] / 1_000_000_000
+                lines.append(f"{idx}. {s['Ticker']} | {s['Final_Score']:.0f}/100")
+                lines.append(f"   Fase: {s['Fase_Wyckoff']} | RSI: {s['RSI']:.0f} | "
+                             f"5d: {s['Change5d%']:+.1f}% | 20d Vol: Rp{vol20_m:.1f}M")
+                lines.append(f"   Akum: {s['Skor_Akumulasi']:.0f} SM: {s['Skor_SmartMoney']:.0f} "
+                             f"Foreign*: {s['Skor_ForeignFlow_PROXY']:.0f} Vol: {s['Skor_Volume']:.0f} "
+                             f"Mom: {s['Skor_Momentum']:.0f} Risk: -{s['RisikoDistribusi']:.0f}")
+                lines.append(f"   Entry: {fmt(s['Entry'])} | SL: -3% ({fmt(s['SL_3pct'])}) "
+                             f"| TP: {fmt(s['TP_resistance'])}")
+                lines.append(f"   {kalimat}")
+            lines.append("")
         lines.append("")
+
+    lines.append(f"📊 Total kandidat: ⭐⭐⭐ {counts['⭐⭐⭐']} | ⭐⭐ {counts['⭐⭐']} | ⭐ {counts['⭐']}")
     lines.append(footer)
     return "\n".join(lines)
 
@@ -1151,7 +1231,8 @@ def run(send=True):
         qualified = [r for r in rows if r["Final_Score"] >= SCORE_THRESHOLD]
         n_qualified = len(qualified)
         picks = qualified[:MAX_PICKS]
-        message = build_message(picks, n_qualified, n_liquid, macro, now)
+        append_backtest_csv(qualified, now)
+        message = build_message(qualified, n_liquid, macro, now)
 
         print("\n" + "=" * 52)
         print(message)
@@ -1247,7 +1328,7 @@ def selftest():
         got = classify_phase(a_, v_, m_, r_, rsi_, rc_, lh_, ab_)
         flag = "OK " if got == expect else "XX "
         print(f"  {flag}harap={expect:<18} dapat={got}")
-    for sc in (95, 85, 75, 65, 50):
+    for sc in (95, 50, 40, 30, 20):
         lab, star = classify_score(sc)
         print(f"  score {sc} -> {star} {lab}")
 
@@ -1257,10 +1338,10 @@ def selftest():
     save_csv(rows, path="/tmp/ranking_selftest.csv")
 
     print("\n-- contoh Telegram (ambang diturunkan utk demo) --")
-    print(build_message(rows[:MAX_PICKS], len(rows), len(rows),
+    print(build_message(rows[:MAX_PICKS], len(rows),
                         {"IHSG_BIAS": "netral", "USD_IDR": "bearish"}, now))
     print("\n-- contoh tidak ada setup --")
-    print(build_message([], 0, len(rows), {}, now))
+    print(build_message([], len(rows), {}, now))
     print("\n[OK] self-test selesai.")
 
 
