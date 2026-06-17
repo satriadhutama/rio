@@ -891,6 +891,23 @@ def macro_context_line(macro: dict) -> str:
 # DOWNLOAD OHLCV (batch + retry + rate-limit)
 # ===========================================================================
 
+EXPECTED_OHLCV = {"Open", "High", "Low", "Close", "Volume"}
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Flatten MultiIndex columns and fix lowercase from newer yfinance."""
+    if isinstance(df.columns, pd.MultiIndex):
+        df = df.copy()
+        df.columns = df.columns.get_level_values(0)
+    rename_map = {}
+    for col in df.columns:
+        if isinstance(col, str) and col.capitalize() in EXPECTED_OHLCV and col != col.capitalize():
+            rename_map[col] = col.capitalize()
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
 def fetch_batch(codes: list, period: str = HISTORY_PERIOD) -> dict:
     import yfinance as yf
     tickers = [f"{c}.JK" for c in codes]
@@ -901,6 +918,10 @@ def fetch_batch(codes: list, period: str = HISTORY_PERIOD) -> dict:
         t = f"{c}.JK"
         try:
             sub = data if len(tickers) == 1 else data[t]
+            sub = normalize_columns(sub)
+            if "Close" not in sub.columns:
+                print(f"  {c}: kolom 'Close' tidak ditemukan, skip")
+                continue
             sub = sub.dropna()
             if len(sub) >= MIN_BARS:
                 out[c] = sub
@@ -948,8 +969,10 @@ def fetch_ihsg():
                          progress=False, auto_adjust=True)
         if df is None or df.empty:
             return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        df = normalize_columns(df)
+        if "Close" not in df.columns:
+            print("[WARN] IHSG: kolom 'Close' tidak ditemukan")
+            return None
         return df["Close"].astype(float)
     except Exception as exc:                             # noqa: BLE001
         print(f"[WARN] gagal ambil IHSG (RS pakai netral): {exc}")
