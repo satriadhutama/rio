@@ -22,11 +22,21 @@ def fetch_price_n_days_later(ticker, screening_date, n):
         df = yf.download(f"{ticker}.JK", start=start.strftime("%Y-%m-%d"),
                           end=end.strftime("%Y-%m-%d"), interval="1d",
                           progress=False, auto_adjust=True)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        col_map = {c: c.capitalize() for c in df.columns
+                   if isinstance(c, str) and c != c.capitalize()
+                   and c.capitalize() in ("Open", "High", "Low", "Close", "Volume")}
+        if col_map:
+            df = df.rename(columns=col_map)
         df = df.dropna()
     except Exception as exc:                             # noqa: BLE001
         print(f"  {ticker}: gagal unduh ({exc})")
         return None
     if len(df) <= n:
+        return None
+    if "Close" not in df.columns:
+        print(f"  {ticker}: kolom 'Close' tidak ditemukan, skip")
         return None
     return float(df["Close"].iloc[n])
 
