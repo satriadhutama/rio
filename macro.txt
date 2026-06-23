@@ -1,0 +1,34 @@
+# ============================================================
+# macro.txt — Input makro MANUAL (kamu isi sendiri tiap hari/minggu)
+# Format: KEY=value. Baris diawali '#' = komentar, diabaikan.
+# Nilai valid: bullish / netral / bearish
+#   (khusus RISK_SENTIMENT: risk_on / netral / risk_off)
+# Kalau file ini tidak ada / key kosong -> dianggap NETRAL (skor 50).
+# ============================================================
+
+# ---------- LAYER 3: MACRO INDONESIA (bobot 15%) ----------
+# bullish = 100, netral = 50, bearish = 20
+IHSG_BIAS=netral
+
+SEKTOR_BANK=netral
+SEKTOR_TAMBANG=netral
+SEKTOR_ENERGI=netral
+SEKTOR_KONSUMER=netral
+SEKTOR_PROPERTI=netral
+SEKTOR_TEKNOLOGI=netral
+
+# Opsional — sektor tambahan (kalau tak diisi, default netral):
+# SEKTOR_FINANSIAL=netral
+# SEKTOR_KESEHATAN=netral
+# SEKTOR_INFRA=netral
+# SEKTOR_INDUSTRI=netral
+
+# ---------- LAYER 4: GLOBAL MACRO (bobot 10%) ----------
+# USD_IDR : bullish = rupiah KUAT (untung importir KONSUMER/TEKNOLOGI),
+#           bearish = rupiah LEMAH (untung eksportir TAMBANG/ENERGI)
+# KOMODITAS: bullish = harga komoditas naik (bonus TAMBANG & ENERGI)
+# RISK_SENTIMENT: risk_on / netral / risk_off (pengaruh ke semua, lebih kuat
+#           ke saham high-beta: TEKNOLOGI / TAMBANG / PROPERTI)
+USD_IDR=netral
+KOMODITAS=netral
+RISK_SENTIMENT=netral
